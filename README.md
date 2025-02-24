@@ -80,7 +80,10 @@ TODO
 ## Demonstration
 
 ### Images
-![Image of both parts of the controller TODO]()
+![Tractor module](images/tractor_module_on.JPEG)
+
+![Seeder module TODO]()
+
 
 ### Video
 [System in action TODO]()
