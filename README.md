@@ -93,34 +93,6 @@ TODO
 
 ### Images
 
-Tractor module in tractor waiting for connection.
-![Tractor module](images/tractor_module_on.JPEG)
-
-Main junction box of the seeder module mounted on the front of the seeder.
-![Seeder module](images/seeder_module.JPEG)
-
-The interior of the main junction box containing the ESP32 module and three-core cables for power, tramline relay, and sensors.
-![Seeder module](images/main_box.JPEG)
-
-Junction box with the relay activating the tramlines. There's also an extra cable that delivers power to the seed tank (needed for the camera setup).
-![Seeder module](images/relay_box.JPEG)
-
-The sensors connect to ground when activated; otherwise, the circuit remains open. The signal wires are connected to 12V through a pull-up resistor, so when the sensor is activated, the voltage on the signal wire drops to zero.
-![Seeder module](images/sensor_box.JPEG)
-
-Sensor mounted on the turbine.
-![Seeder module](images/turbine_sensor.JPEG)
-
-Sensor mounted on the metering unit, along the a set of magnets.
-![Seeder module](images/metering_unit_sensor.JPEG)
-
-Overview of the seeder module.
-![Seeder module](images/junction_boxes_overview.JPEG)
-
----
-
-### Images
-
 <p align="center">
   <img src="images/tractor_module_on.JPEG" alt="Tractor module" width="90%"/>
 </p>
