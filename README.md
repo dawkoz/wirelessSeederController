@@ -117,10 +117,7 @@ Sensor mounted on the metering unit, along the a set of magnets.
 Overview of the seeder module.
 ![Seeder module](images/junction_boxes_overview.JPEG)
 
-
-----
-
-
+---
 
 ### Images
 
@@ -129,73 +126,78 @@ Overview of the seeder module.
 </p>
 
 ### Tractor Module
+
 Tractor module in the tractor waiting for connection.
 
-
+<br><br><br>
 
 <p align="center">
   <img src="images/seeder_module.JPEG" alt="Seeder module" width="90%"/>
 </p>
 
 ### Seeder Module
+
 Main junction box of the seeder module mounted on the front of the seeder.
 
-
+<br><br><br>
 
 <p align="center">
   <img src="images/main_box.JPEG" alt="Main junction box" width="90%"/>
 </p>
 
 ### Main Junction Box
+
 The interior of the main junction box containing the ESP32 module and three-core cables for power, tramline relay, and sensors.
 
-
+<br><br><br>
 
 <p align="center">
   <img src="images/relay_box.JPEG" alt="Relay box" width="90%"/>
 </p>
 
 ### Relay Box
+
 Junction box with the relay activating the tramlines. There's also an extra cable that delivers power to the seed tank (needed for the camera setup).
 
-
+<br><br><br>
 
 <p align="center">
   <img src="images/sensor_box.JPEG" alt="Sensor box" width="90%"/>
 </p>
 
 ### Sensor Box
+
 The sensors connect to ground when activated; otherwise, the circuit remains open. The signal wires are connected to 12V through a pull-up resistor, so when the sensor is activated, the voltage on the signal wire drops to zero.
 
-
+<br><br><br>
 
 <p align="center">
   <img src="images/turbine_sensor.JPEG" alt="Turbine sensor" width="90%"/>
 </p>
 
 ### Turbine Sensor
+
 Sensor mounted on the turbine.
 
-
+<br><br><br>
 
 <p align="center">
   <img src="images/metering_unit_sensor.JPEG" alt="Metering unit sensor" width="90%"/>
 </p>
 
 ### Metering Unit Sensor
+
 Sensor mounted on the metering unit, along with a set of magnets.
 
-
+<br><br><br>
 
 <p align="center">
   <img src="images/junction_boxes_overview.JPEG" alt="Junction boxes overview" width="90%"/>
 </p>
 
 ### Overview of Seeder Module
+
 Overview of the seeder module.
-
-
-
 
 ### Video
 
