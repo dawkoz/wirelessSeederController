@@ -51,12 +51,7 @@ The communication between the tractor and the seeder is handled using ESP-NOW, e
 
 ## Software Setup
 
-### Libraries Required
-
-Install the following libraries in the Arduino IDE:
-
-1. Adafruit GFX
-2. Adafruit SSD1306
+This project is built with [PlatformIO](https://platformio.org/) rather than the Arduino IDE. It's a single PlatformIO project containing one build environment per physical ESP32 module: `tractor`, `seeder`, and `dispenser` (see [CLAUDE.md](CLAUDE.md) for the full repo layout and hardware/pin reference). Libraries are declared in `platformio.ini` and fetched automatically per environment — no manual library installation needed.
 
 ### Seeder Code
 
@@ -76,10 +71,15 @@ TODO
 
 ### Uploading the Code
 
-1. Open the respective Arduino sketches for the seeder and tractor.
-2. Replace the MAC addresses with the actual MAC addresses of your ESP32 modules.
+1. Open this folder in VS Code with the [PlatformIO extension](https://platformio.org/install/ide?install=vscode) installed (or use the `pio` CLI directly).
+2. Replace the MAC addresses in `src/tractor/main.cpp` and `src/seeder/main.cpp` with the actual MAC addresses of your ESP32 modules.
 3. Pick the type of alerts you want to receive and numbers of lines that trigger the tramline relay.
-4. Upload the code to the ESP32 devices.
+4. Select the environment for the board you're flashing (`tractor` or `seeder`) from the PlatformIO status bar at the bottom of VS Code, then click Upload — or from the command line:
+
+   ```bash
+   pio run -e tractor -t upload
+   pio run -e seeder -t upload
+   ```
 
 ## Operation
 

@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
 
@@ -5,6 +6,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH1106.h>
+
+#include "espnow_protocol.h"
 
 #define BUTTON_PIN 12       // Pin for the button
 #define GREEN_LED_PIN 14    // Pin for the green LED
@@ -25,23 +28,10 @@ uint8_t broadcastAddressSeeder[] = {0x3c, 0x71, 0xbf, 0x13, 0x6c, 0xdc};
 // Debounce and button variables
 int lastSteadyState = LOW;       // the previous steady state from the input pin
 int lastFlickerableState = LOW;  // the previous flickerable state from the input pin
-int currentState;   
+int currentState;
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 50;
 int tramlineNumber = 0;
-
-// Structure to send data
-typedef struct struct_tractor {
-    bool tramlineActive;
-} struct_tractor;
-
-// Structure to receive data
-typedef struct struct_seeder {
-    int turbineRPM;
-    int WOMRPM;
-    bool mechanismTurning;
-    bool tramlineActive;
-} struct_seeder;
 
 // Create struct instances
 struct_tractor tractorData;
@@ -64,6 +54,9 @@ bool enableWOMAlarm = false;
 //Variables for sending data
 unsigned long lastMessageSendingTime = 0;
 const int sendingInterval = 200;
+
+void updateFaultStatus();
+void updateDisplay();
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     Serial.print("\r\nLast Packet Send Status:\t");
@@ -98,7 +91,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 
     updateDisplay();
     updateFaultStatus();
-    
+
 
 }
 

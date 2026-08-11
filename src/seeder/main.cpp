@@ -1,5 +1,8 @@
+#include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
+
+#include "espnow_protocol.h"
 
 // Relay control pin
 #define RELAY_PIN 12
@@ -12,19 +15,6 @@ uint8_t broadcastAddressTractor[] = {0x80, 0x7d, 0x3a, 0xf3, 0x4a, 0xa0};
 //Variables for sending data
 unsigned long lastMessageSendingTime = 0;
 const int sendingInterval = 200;
-
-// Structure to send data
-typedef struct struct_seeder {
-    int turbineRPM;
-    int WOMRPM;
-    bool mechanismTurning;
-    bool tramlineActive;
-} struct_seeder;
-
-// Structure to receive data
-typedef struct struct_tractor {
-    bool tramlineActive;
-} struct_tractor;
 
 // Create struct instances
 struct_seeder seederData;
@@ -124,7 +114,7 @@ void setup() {
     seederData.WOMRPM = 0;
     seederData.mechanismTurning = false;
     seederData.tramlineActive = false;
-    
+
     // Set pin modes
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, HIGH);  // Ensure RELAY is off initially
