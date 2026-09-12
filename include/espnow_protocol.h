@@ -1,18 +1,210 @@
 #pragma once
 
-// Shared ESP-NOW wire structs for the tractor <-> seeder link. Both boards
-// include this same header so the struct layout used by esp_now_send/
-// memcpy can never drift out of sync between the two firmwares.
+#include <Arduino.h>
+#include <string.h>
 
-// Seeder -> Tractor
-typedef struct struct_seeder {
-    int turbineRPM;
-    int WOMRPM;
-    bool mechanismTurning;
-    bool tramlineActive;
-} struct_seeder;
+// ---------------------------------------------------------------------------
+// Shared ESP-NOW wire protocol for the tractor / seeder / dispenser boards.
+//
+// All three boards include this same file, so the byte layout can never drift
+// between them. Changing anything here means reflashing EVERY board.
+//
+// Addressing is broadcast (FF:FF:FF:FF:FF:FF). No board knows any other
+// board's MAC address, so a module can be swapped for a new one without
+// touching firmware anywhere. Packets are told apart by the `type` and
+// `sender` fields below, not by who they arrived from.
+// ---------------------------------------------------------------------------
 
-// Tractor -> Seeder
-typedef struct struct_tractor {
-    bool tramlineActive;
-} struct_tractor;
+// Two fixed bytes at the start of every packet ("Kverneland Seeder"). ESP-NOW
+// hands us any frame that lands on our channel, including from unrelated
+// projects - checking these first throws out anything that isn't ours before
+// it can be interpreted as data.
+static constexpr uint8_t PROTOCOL_MAGIC_0 = 'K';
+static constexpr uint8_t PROTOCOL_MAGIC_1 = 'S';
+
+// Bump when the layout of any struct below changes. Receivers drop packets
+// that don't match, so a half-updated set of boards fails loudly instead of
+// quietly misreading each other.
+// v3: added dispenser on/off and the automated calibration run.
+static constexpr uint8_t PROTOCOL_VERSION = 3;
+
+// Distinguishes this machine from an identical one working the next field.
+static constexpr uint8_t NETWORK_ID = 1;
+
+// Every board transmits on this fixed channel. Must match on all three.
+static constexpr uint8_t ESPNOW_CHANNEL = 1;
+
+// How often every board transmits.
+static constexpr uint32_t SEND_INTERVAL_MS = 200;
+
+// How long a peer may stay silent before it counts as disconnected.
+// At SEND_INTERVAL_MS that is 5 consecutive missed packets.
+static constexpr uint32_t LINK_TIMEOUT_MS = 1000;
+
+static const uint8_t BROADCAST_ADDRESS[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+enum class NodeId : uint8_t {
+    Tractor   = 1,
+    Seeder    = 2,
+    Dispenser = 3,
+};
+
+enum class MsgType : uint8_t {
+    SeederTelemetry = 1,
+    TractorCommand  = 2,
+    DispenserStatus = 3,
+};
+
+// `linkFlags` reports which nodes the SENDER of the packet has heard from
+// recently. This is how the tractor finds out whether the seeder and the
+// dispenser can hear each other - something it has no direct way to observe.
+static constexpr uint8_t LINK_HEARD_TRACTOR   = 1 << 0;
+static constexpr uint8_t LINK_HEARD_SEEDER    = 1 << 1;
+static constexpr uint8_t LINK_HEARD_DISPENSER = 1 << 2;
+
+enum class DispenserFault : uint8_t {
+    None        = 0,
+    NoSpeedData = 1,  // seeder unheard, cannot meter at all
+    Stalled     = 2,  // motor commanded but the shaft is not turning
+    OverSpeed   = 3,  // required RPM is beyond what the motor can deliver
+};
+
+// Automated calibration: the dispenser turns its output shaft exactly
+// CALIBRATION_REVOLUTIONS times so the operator can catch and weigh the
+// output instead of turning the shaft by hand.
+enum class CalibrationState : uint8_t {
+    Idle    = 0,
+    Running = 1,
+    Done    = 2,
+    Refused = 3,   // machine was moving, so starting a run would be unsafe
+};
+
+static constexpr uint16_t CALIBRATION_REVOLUTIONS = 100;
+
+struct __attribute__((packed)) MessageHeader {
+    uint8_t magic0;
+    uint8_t magic1;
+    uint8_t version;
+    uint8_t networkId;
+    MsgType type;
+    NodeId  sender;
+    uint8_t linkFlags;
+    uint8_t reserved;   // keeps the header at 8 bytes and leaves room to grow
+};
+static_assert(sizeof(MessageHeader) == 8, "MessageHeader layout changed - reflash ALL boards");
+
+// Seeder -> everyone
+struct __attribute__((packed)) SeederTelemetry {
+    MessageHeader header;
+    uint32_t upTimeMs;
+    uint32_t wheelPulses;      // cumulative since boot, never reset (see below)
+    uint16_t turbineRPM;
+    uint16_t womRPM;
+    uint16_t groundSpeedMmS;
+    uint8_t  wheelTurning;
+    uint8_t  tramlineRelayOn;  // actual relay state, not the commanded one
+};
+static_assert(sizeof(SeederTelemetry) == 24, "SeederTelemetry layout changed - reflash ALL boards");
+
+// Tractor -> everyone
+struct __attribute__((packed)) TractorCommand {
+    MessageHeader header;
+    uint8_t  tramlineNumber;     // 0-based; display adds 1
+    uint8_t  tramlineRelayOn;
+    uint8_t  dispenserEnabled;   // operator's Wl./Wyl. setting
+    uint8_t  calibrationRun;     // level-triggered: 1 = perform a calibration
+                                 // run now, 0 = don't / stop. Repeated at the
+                                 // normal send rate, so it survives a lost
+                                 // packet without needing an ack.
+    uint16_t doseKgPerHa;
+    uint32_t gramsPer100Rev;     // dispenser calibration, broadcast so the
+                                 // dispenser never holds its own copy
+};
+static_assert(sizeof(TractorCommand) == 18, "TractorCommand layout changed - reflash ALL boards");
+
+// Dispenser -> everyone
+struct __attribute__((packed)) DispenserStatus {
+    MessageHeader    header;
+    uint16_t         targetShaftRPM;
+    uint16_t         measuredShaftRPM;
+    uint16_t         motorCommandedPermille;   // 0..1000
+    uint8_t          motorRunning;
+    DispenserFault   faultCode;
+    CalibrationState calibrationState;
+    uint8_t          calibrationPercent;       // 0..100
+};
+static_assert(sizeof(DispenserStatus) == 18, "DispenserStatus layout changed - reflash ALL boards");
+
+// Why wheelPulses is cumulative rather than "pulses since the last packet":
+// ESP-NOW is lossy, and a per-interval count that goes missing is gone for
+// good, biasing distance and average speed low. A cumulative counter heals
+// itself - a receiver that misses several packets still computes the correct
+// delta as soon as the next one arrives. It also gives total distance free.
+
+inline void fillHeader(MessageHeader &header, MsgType type, NodeId sender, uint8_t linkFlags)
+{
+    header.magic0    = PROTOCOL_MAGIC_0;
+    header.magic1    = PROTOCOL_MAGIC_1;
+    header.version   = PROTOCOL_VERSION;
+    header.networkId = NETWORK_ID;
+    header.type      = type;
+    header.sender    = sender;
+    header.linkFlags = linkFlags;
+    header.reserved  = 0;
+}
+
+// Every receive path must call this before copying anything out of the buffer.
+// Checking the length is what stops a packet of the wrong size being memcpy'd
+// past the end of the incoming data.
+inline bool headerValid(const uint8_t *data, int len, MsgType expectedType, size_t expectedSize)
+{
+    if (data == nullptr) return false;
+    if (len != (int)expectedSize) return false;
+
+    MessageHeader header;
+    memcpy(&header, data, sizeof(header));
+
+    return header.magic0    == PROTOCOL_MAGIC_0
+        && header.magic1    == PROTOCOL_MAGIC_1
+        && header.version   == PROTOCOL_VERSION
+        && header.networkId == NETWORK_ID
+        && header.type      == expectedType;
+}
+
+// Tracks when each peer was last heard from. Lives here so all three boards
+// agree on what "connected" means. Written from the ESP-NOW receive callback
+// and read from loop(); 32-bit aligned accesses are atomic on the ESP32, so
+// no locking is needed.
+class LinkTracker {
+public:
+    void noteReceived(NodeId sender)
+    {
+        uint8_t i = (uint8_t)sender;
+        if (i < 4) lastRxMs[i] = millis();
+    }
+
+    bool isAlive(NodeId node) const
+    {
+        uint32_t last = lastRxMs[(uint8_t)node];
+        return last != 0 && (millis() - last) < LINK_TIMEOUT_MS;
+    }
+
+    // UINT32_MAX if never heard from at all.
+    uint32_t silentForMs(NodeId node) const
+    {
+        uint32_t last = lastRxMs[(uint8_t)node];
+        return (last == 0) ? UINT32_MAX : (millis() - last);
+    }
+
+    uint8_t flags() const
+    {
+        uint8_t f = 0;
+        if (isAlive(NodeId::Tractor))   f |= LINK_HEARD_TRACTOR;
+        if (isAlive(NodeId::Seeder))    f |= LINK_HEARD_SEEDER;
+        if (isAlive(NodeId::Dispenser)) f |= LINK_HEARD_DISPENSER;
+        return f;
+    }
+
+private:
+    volatile uint32_t lastRxMs[4] = {0, 0, 0, 0};   // indexed by NodeId
+};
