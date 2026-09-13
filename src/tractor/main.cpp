@@ -8,16 +8,11 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH1106.h>
 
+#include "machine_settings.h"
 #include "espnow_protocol.h"
 
 // Tractor module. Operator interface: OLED, one button, three LEDs, buzzer.
 // Owns the tramline selection and the dispenser settings, and broadcasts them.
-
-#define BUTTON_PIN 12       // active LOW
-#define GREEN_LED_PIN 14    // all links healthy
-#define BLUE_LED_PIN 27     // blinks when a link is down
-#define YELLOW_LED_PIN 13   // tramline relay confirmed active by the seeder
-#define BUZZER_PIN 19
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -26,33 +21,11 @@
 static Adafruit_SH1106 oled((int8_t)OLED_RESET);
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Display and editor limits
 // ---------------------------------------------------------------------------
-
-static constexpr uint8_t TRAMLINE_RHYTHM = 6;
-
-// Bit N set means the relay fires on pass N (0-based, so bit 2 is the pass
-// shown as "3" on the display). Was hardcoded as `== 2 || == 3`.
-static constexpr uint8_t TRAMLINE_ACTIVE_MASK = (1 << 2) | (1 << 3);
-
-// These two alarms stay off until a real WOM sensor exists - the seeder still
-// reports a hardcoded 540, so they would be meaningless.
-static constexpr bool ENABLE_TURBINE_ALARM = false;
-static constexpr bool ENABLE_WOM_ALARM     = false;
-
-static constexpr uint16_t DEFAULT_DOSE_KG_PER_HA   = 40;
-static constexpr uint32_t DEFAULT_GRAMS_PER_100REV = 500;
 
 static constexpr uint16_t MAX_DOSE_KG_PER_HA   = 999;     // 3 digits
 static constexpr uint32_t MAX_GRAMS_PER_100REV = 99999;   // 5 digits
-
-static constexpr uint32_t DEBOUNCE_MS   = 50;
-static constexpr uint32_t LONG_PRESS_MS = 1500;
-
-// A link being down lights the LED and shows a letter immediately, but only
-// nags with the buzzer once it has stayed down this long - short radio
-// hiccups shouldn't make noise.
-static constexpr uint32_t LINK_BUZZER_DELAY_MS = 5000;
 
 static constexpr uint32_t DISPLAY_INTERVAL_MS = 200;
 
@@ -214,7 +187,7 @@ static ButtonEvent readButton(uint32_t now)
         buttonFlicker  = pressed;
         lastDebounceMs = now;
     }
-    if (now - lastDebounceMs < DEBOUNCE_MS) return ButtonEvent::None;
+    if (now - lastDebounceMs < BUTTON_DEBOUNCE_MS) return ButtonEvent::None;
 
     buttonStable = buttonFlicker;
 
@@ -223,7 +196,7 @@ static ButtonEvent readButton(uint32_t now)
         buttonDownMs     = now;
         longAlreadyFired = false;
     } else if (buttonStable && buttonHeld && !longAlreadyFired &&
-               (now - buttonDownMs >= LONG_PRESS_MS)) {
+               (now - buttonDownMs >= BUTTON_LONG_PRESS_MS)) {
         longAlreadyFired = true;
         return ButtonEvent::Long;
     } else if (!buttonStable && buttonHeld) {
@@ -425,11 +398,11 @@ static void updateFaults(uint32_t now)
     }
 
     // Highest priority first.
-    if (ENABLE_WOM_ALARM && seederData.wheelTurning && seederData.womRPM < 50) {
+    if (ENABLE_WOM_ALARM && seederData.wheelTurning && seederData.womRPM < WOM_RUNNING_MIN_RPM) {
         faultCode = FaultCode::WomOff;
-    } else if (ENABLE_TURBINE_ALARM && seederData.wheelTurning && seederData.turbineRPM < 50) {
+    } else if (ENABLE_TURBINE_ALARM && seederData.wheelTurning && seederData.turbineRPM < TURBINE_RUNNING_MIN_RPM) {
         faultCode = FaultCode::TurbineOff;
-    } else if (ENABLE_WOM_ALARM && !seederData.wheelTurning && seederData.womRPM >= 50) {
+    } else if (ENABLE_WOM_ALARM && !seederData.wheelTurning && seederData.womRPM >= WOM_RUNNING_MIN_RPM) {
         faultCode = FaultCode::WomWhileLifted;
     } else if (dispenserEverSeen && dispenserData.faultCode == DispenserFault::Stalled) {
         faultCode = FaultCode::DispenserStalled;
@@ -755,7 +728,7 @@ void setup()
     gramsPer100Rev   = prefs.getULong("calib",  DEFAULT_GRAMS_PER_100REV);
     dispenserEnabled = prefs.getBool("disp_on", false);
 
-    oled.begin(SH1106_SWITCHCAPVCC, 0x3C);
+    oled.begin(SH1106_SWITCHCAPVCC, OLED_I2C_ADDRESS);
     // oled.begin() calls Wire.begin(), which leaves the bus at the Arduino
     // default of 100 kHz. A full framebuffer push is ~1150 bytes, so at
     // 100 kHz every redraw blocks loop() for ~100 ms - long enough that the

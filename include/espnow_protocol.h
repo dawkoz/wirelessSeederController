@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include "machine_settings.h"   // NETWORK_ID, ESPNOW_CHANNEL, SEND_INTERVAL_MS, LINK_TIMEOUT_MS
+
 // ---------------------------------------------------------------------------
 // Shared ESP-NOW wire protocol for the tractor / seeder / dispenser boards.
 //
@@ -27,19 +29,6 @@ static constexpr uint8_t PROTOCOL_MAGIC_1 = 'S';
 // quietly misreading each other.
 // v3: added dispenser on/off and the automated calibration run.
 static constexpr uint8_t PROTOCOL_VERSION = 3;
-
-// Distinguishes this machine from an identical one working the next field.
-static constexpr uint8_t NETWORK_ID = 1;
-
-// Every board transmits on this fixed channel. Must match on all three.
-static constexpr uint8_t ESPNOW_CHANNEL = 1;
-
-// How often every board transmits.
-static constexpr uint32_t SEND_INTERVAL_MS = 200;
-
-// How long a peer may stay silent before it counts as disconnected.
-// At SEND_INTERVAL_MS that is 5 consecutive missed packets.
-static constexpr uint32_t LINK_TIMEOUT_MS = 1000;
 
 static const uint8_t BROADCAST_ADDRESS[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -78,8 +67,6 @@ enum class CalibrationState : uint8_t {
     Done    = 2,
     Refused = 3,   // machine was moving, so starting a run would be unsafe
 };
-
-static constexpr uint16_t CALIBRATION_REVOLUTIONS = 100;
 
 struct __attribute__((packed)) MessageHeader {
     uint8_t magic0;

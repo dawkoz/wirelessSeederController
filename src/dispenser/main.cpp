@@ -3,93 +3,19 @@
 #include <esp_wifi.h>
 #include <WiFi.h>
 
+#include "machine_settings.h"
 #include "espnow_protocol.h"
 
 // Fertilizer dispenser module. Meters fertilizer in proportion to the ground
 // speed broadcast by the seeder, using the dose and calibration broadcast by
 // the tractor. Cytron MD13S driver, Pololu 4752 motor with built-in encoder.
 
-// Pins verified against the Espressif GPIO reference: none are strapping
-// pins, none touch the SPI flash, all support interrupts and internal
-// pull-ups, and none of them output a PWM signal during boot the way GPIO
-// 0/5/14/15 do. See docs/dispenser_module_hardware.md section 2.
-#define MOTOR_PWM_PIN 25
-#define MOTOR_DIR_PIN 26
-#define ENCODER_A_PIN 32
-#define ENCODER_B_PIN 33   // wired but unused - see "Counting" below
-
-// !!! HARDWARE REQUIREMENT: 10k pull-down resistors from the MD13S PWM and
-// DIR inputs to GND. ESP32 pins are high-impedance during reset and until
-// setup() runs, so without them the driver's inputs float and the motor can
-// run before any of this code executes. Writing PWM = 0 first in setup()
-// covers everything after boot, but nothing in firmware can cover the window
-// before firmware starts.
-
-// !!! The encoder outputs sit at whatever voltage its Vcc is fed. Powering it
-// from 12V would put 12V straight onto a GPIO and destroy the board. Feed it
-// 5V and divide A/B down to 3.3V (its spec minimum is 3.5V, so 3.3V is
-// marginally out of spec - verify on the bench before relying on it).
-
-// Direction is fixed; the auger only runs one way in normal use. Kept on a
-// real GPIO so it can be reversed to clear a blockage later.
-static constexpr uint8_t MOTOR_DIR_FORWARD = LOW;
-
 static constexpr uint8_t  LEDC_CHANNEL    = 0;
-// MD13S is specified for PWM "up to 20 kHz"; 16 kHz keeps margin below that
-// limit while staying out of the range that makes an audible whine.
-static constexpr uint32_t LEDC_FREQUENCY  = 16000;
 static constexpr uint8_t  LEDC_RESOLUTION = 10;     // 0..1023
 static constexpr uint16_t LEDC_MAX        = (1 << LEDC_RESOLUTION) - 1;
 
-// ---------------------------------------------------------------------------
-// Machine constants
-// ---------------------------------------------------------------------------
-
-// Seeder working width. Fixed on this machine, so it lives here rather than
-// being another number to type in on the tractor.
-static constexpr uint32_t WORKING_WIDTH_CM = 400;   // 4.00 m
-
-// Counting: the auger turns one way only, so full quadrature decoding buys
-// nothing. Counting rising edges on channel A alone gives 64/4 = 16 edges per
-// motor revolution, times the 30:1 gearbox.
-// !!! VERIFY EMPIRICALLY - Pololu's "64 CPR" is quadrature counts. Turn the
-// output shaft exactly 10 revolutions by hand and check the counter.
-static constexpr uint32_t ENCODER_EDGES_PER_REV = 480;
-
-// Pololu 4752 free-running output speed at 12V.
-static constexpr uint16_t MOTOR_MAX_RPM = 330;
-
-// Below this duty a DC motor just buzzes without turning, so the output is
-// either zero or at least this much - never left in the dead band.
-static constexpr uint16_t MIN_RUNNING_PERMILLE = 80;
-
-// ---------------------------------------------------------------------------
-// Timing
-// ---------------------------------------------------------------------------
-
-static constexpr uint32_t CONTROL_INTERVAL_MS = 100;
-static constexpr uint32_t STALL_TIMEOUT_MS    = 1500;
-static constexpr uint16_t STALL_RPM_THRESHOLD = 5;
-
-static constexpr uint32_t MIN_ENCODER_PULSE_INTERVAL_US = 100;
-
-// Speed used for the automated calibration run. Moderate, so the auger fills
-// the same way it does in work and the run takes a sensible time:
-// 100 revolutions at 120 RPM is 50 seconds.
-static constexpr uint16_t CALIBRATION_RPM = 120;
-
 static constexpr uint32_t CALIBRATION_TOTAL_EDGES =
     (uint32_t)CALIBRATION_REVOLUTIONS * ENCODER_EDGES_PER_REV;
-
-// ---------------------------------------------------------------------------
-// Control gains. The feed-forward term does essentially all the work once the
-// calibration is right; the PI only trims out battery sag and auger load, so
-// it can stay gentle and is hard to destabilise.
-// ---------------------------------------------------------------------------
-
-static constexpr float KP = 0.8f;
-static constexpr float KI = 0.4f;
-static constexpr float INTEGRAL_LIMIT = 400.0f;
 
 // ---------------------------------------------------------------------------
 // State
@@ -132,7 +58,7 @@ static bool haveCommand = false;
 void IRAM_ATTR encoderPulseISR()
 {
     uint32_t now = micros();
-    if (now - lastEncoderEdgeUs < MIN_ENCODER_PULSE_INTERVAL_US) return;
+    if (now - lastEncoderEdgeUs < ENCODER_MIN_PULSE_GAP_US) return;
     lastEncoderEdgeUs = now;
     encoderEdgeTotal++;
 }
@@ -216,16 +142,16 @@ static uint16_t computeDuty(uint16_t target, uint32_t elapsed)
     float feedForward = (float)target * 1000.0f / (float)MOTOR_MAX_RPM;
 
     float error = (float)target - (float)measuredShaftRPM;
-    integralTerm += error * ((float)elapsed / 1000.0f) * KI;
-    if (integralTerm >  INTEGRAL_LIMIT) integralTerm =  INTEGRAL_LIMIT;
-    if (integralTerm < -INTEGRAL_LIMIT) integralTerm = -INTEGRAL_LIMIT;
+    integralTerm += error * ((float)elapsed / 1000.0f) * MOTOR_KI;
+    if (integralTerm >  MOTOR_INTEGRAL_LIMIT) integralTerm =  MOTOR_INTEGRAL_LIMIT;
+    if (integralTerm < -MOTOR_INTEGRAL_LIMIT) integralTerm = -MOTOR_INTEGRAL_LIMIT;
 
-    float output = feedForward + KP * error + integralTerm;
+    float output = feedForward + MOTOR_KP * error + integralTerm;
     if (output < 0.0f)    output = 0.0f;
     if (output > 1000.0f) output = 1000.0f;
 
     uint16_t permille = (uint16_t)output;
-    if (permille > 0 && permille < MIN_RUNNING_PERMILLE) permille = MIN_RUNNING_PERMILLE;
+    if (permille > 0 && permille < MOTOR_MIN_RUNNING_PERMILLE) permille = MOTOR_MIN_RUNNING_PERMILLE;
     return permille;
 }
 
@@ -295,7 +221,7 @@ static bool runCalibration(uint32_t now, uint32_t elapsed)
 static void runControl(uint32_t now)
 {
     uint32_t elapsed = now - encoderSnapshotMs;
-    if (elapsed < CONTROL_INTERVAL_MS) return;
+    if (elapsed < MOTOR_CONTROL_INTERVAL_MS) return;
 
     updateMeasuredRPM(now, elapsed);
 
@@ -332,7 +258,7 @@ static void runControl(uint32_t now)
     // Stall detection: commanded to turn, but the shaft isn't. A blocked or
     // decoupled dispenser is otherwise completely silent, and the failure is
     // only discovered once a whole field has been done wrong.
-    if (permille >= MIN_RUNNING_PERMILLE) {
+    if (permille >= MOTOR_MIN_RUNNING_PERMILLE) {
         if (motorCommandedSinceMs == 0) motorCommandedSinceMs = now;
     } else {
         motorCommandedSinceMs = 0;
@@ -394,7 +320,7 @@ void setup()
     // what hold the driver off during reset and boot.
     pinMode(MOTOR_DIR_PIN, OUTPUT);
     digitalWrite(MOTOR_DIR_PIN, MOTOR_DIR_FORWARD);
-    ledcSetup(LEDC_CHANNEL, LEDC_FREQUENCY, LEDC_RESOLUTION);
+    ledcSetup(LEDC_CHANNEL, MOTOR_PWM_FREQUENCY_HZ, LEDC_RESOLUTION);
     ledcAttachPin(MOTOR_PWM_PIN, LEDC_CHANNEL);
     ledcWrite(LEDC_CHANNEL, 0);
 

@@ -1,73 +1,33 @@
 #include <Arduino.h>
 #include <esp_now.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <WiFi.h>
 
+#include "machine_settings.h"
 #include "espnow_protocol.h"
+#include "wheel_speed.h"
 
 // Seeder module. Reads the turbine and ground-wheel sensors, drives the
 // tramline relay on command from the tractor, and broadcasts telemetry.
-
-#define RELAY_PIN 12
-#define TURBINE_INDUCTIVE_SENSOR_PIN 14
-#define WHEEL_HALL_SENSOR_PIN 27          // metering unit, driven by the ground wheel
-
-// The relay board is active LOW.
-static constexpr uint8_t RELAY_ON  = LOW;
-static constexpr uint8_t RELAY_OFF = HIGH;
-
-// ---------------------------------------------------------------------------
-// Calibration
-// ---------------------------------------------------------------------------
-
-// !!! PLACEHOLDER - MUST BE MEASURED BEFORE THE SPEED READING MEANS ANYTHING.
-// The ground wheel drives the metering unit through a fixed coupling that sits
-// BEFORE the seed-rate gearbox, so this value does not change when the seed
-// rate is adjusted. To measure it: note wheelPulses, roll the seeder along a
-// tape-measured 20 m, note wheelPulses again, then
-//     MM_PER_PULSE = 20000 / (pulses after - pulses before)
-static constexpr uint32_t MM_PER_PULSE = 300;
-
-// One hole in the turbine disc per revolution.
-static constexpr uint32_t TURBINE_PULSES_PER_REV = 1;
-
-// ---------------------------------------------------------------------------
-// Timing
-// ---------------------------------------------------------------------------
-
-static constexpr uint32_t TURBINE_UPDATE_INTERVAL_MS = 2000;
-static constexpr uint32_t SPEED_UPDATE_INTERVAL_MS   = 500;
-
-// No wheel pulse for this long means the seeder really has stopped (or has
-// been lifted at the headland) rather than just crawling between magnets.
-static constexpr uint32_t WHEEL_STOP_TIMEOUT_MS = 2000;
-
-// Shortest credible gap between real pulses. Anything faster is electrical
-// noise on the sensor line, and left unfiltered it would inflate the reported
-// speed - which, once the dispenser meters to speed, means over-applying.
-static constexpr uint32_t MIN_TURBINE_PULSE_INTERVAL_US = 1000;
-static constexpr uint32_t MIN_WHEEL_PULSE_INTERVAL_US   = 5000;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
-// ISRs only ever increment these; they are never reset, so no pulse can be
-// lost in a read-modify-write race with loop().
-static volatile uint32_t turbinePulseTotal = 0;
-static volatile uint32_t wheelPulseTotal   = 0;
-
+// The turbine ISR only ever increments this and it is never reset, so no
+// pulse can be lost in a read-modify-write race with loop().
+static volatile uint32_t turbinePulseTotal  = 0;
 static volatile uint32_t lastTurbinePulseUs = 0;
-static volatile uint32_t lastWheelPulseUs   = 0;
 
-static uint32_t turbineSnapshot     = 0;
-static uint32_t turbineSnapshotMs   = 0;
-static uint16_t turbineRPM          = 0;
+static uint32_t turbineSnapshot   = 0;
+static uint32_t turbineSnapshotMs = 0;
+static uint16_t turbineRPM        = 0;
 
-static uint32_t wheelSnapshot       = 0;
-static uint32_t wheelSnapshotMs     = 0;
-static uint32_t lastWheelMovementMs = 0;
-static uint16_t groundSpeedMmS      = 0;
+// Written by the wheel ISR. loop() holds wheelLock while it copies the times
+// out, so it never sees a half-recorded pulse.
+static WheelPulses  wheelPulses = {};
+static portMUX_TYPE wheelLock   = portMUX_INITIALIZER_UNLOCKED;
 
 static uint32_t lastSendMs = 0;
 
@@ -85,17 +45,19 @@ static bool haveCommand = false;
 void IRAM_ATTR turbinePulseISR()
 {
     uint32_t now = micros();
-    if (now - lastTurbinePulseUs < MIN_TURBINE_PULSE_INTERVAL_US) return;
+    if (now - lastTurbinePulseUs < TURBINE_MIN_PULSE_GAP_US) return;
     lastTurbinePulseUs = now;
     turbinePulseTotal++;
 }
 
 void IRAM_ATTR wheelPulseISR()
 {
-    uint32_t now = micros();
-    if (now - lastWheelPulseUs < MIN_WHEEL_PULSE_INTERVAL_US) return;
-    lastWheelPulseUs = now;
-    wheelPulseTotal++;
+    // 64-bit microseconds never wrap; micros() does after 71 minutes.
+    uint64_t now = (uint64_t)esp_timer_get_time();
+
+    portENTER_CRITICAL_ISR(&wheelLock);
+    recordWheelPulse(wheelPulses, now);
+    portEXIT_CRITICAL_ISR(&wheelLock);
 }
 
 // Does nothing but validate, copy and timestamp. Everything else happens in
@@ -136,36 +98,6 @@ static void updateTurbineRPM(uint32_t nowMs)
     turbineRPM = (uint16_t)((pulses * 60000UL) / (elapsed * TURBINE_PULSES_PER_REV));
 }
 
-static void updateGroundSpeed(uint32_t nowMs)
-{
-    if (nowMs - wheelSnapshotMs < SPEED_UPDATE_INTERVAL_MS) return;
-
-    uint32_t total   = wheelPulseTotal;
-    uint32_t pulses  = total - wheelSnapshot;
-    uint32_t elapsed = nowMs - wheelSnapshotMs;
-
-    wheelSnapshot   = total;
-    wheelSnapshotMs = nowMs;
-
-    if (pulses > 0) {
-        lastWheelMovementMs = nowMs;
-        if (elapsed > 0) {
-            groundSpeedMmS = (uint16_t)((pulses * MM_PER_PULSE * 1000UL) / elapsed);
-        }
-    } else if (nowMs - lastWheelMovementMs >= WHEEL_STOP_TIMEOUT_MS) {
-        // Genuinely stopped, or lifted at the headland.
-        groundSpeedMmS = 0;
-    }
-    // Between those two cases the wheel is turning slower than one pulse per
-    // window - hold the last speed rather than reporting a false zero.
-}
-
-static bool wheelIsTurning(uint32_t nowMs)
-{
-    return (lastWheelMovementMs != 0) &&
-           (nowMs - lastWheelMovementMs < WHEEL_STOP_TIMEOUT_MS);
-}
-
 static void applyRelay()
 {
     bool on = haveCommand && latestCommand.tramlineRelayOn;
@@ -198,6 +130,16 @@ static void sendTelemetry(uint32_t nowMs)
     if (nowMs - lastSendMs < SEND_INTERVAL_MS) return;
     lastSendMs = nowMs;
 
+    uint64_t recentUs[WHEEL_RING_SIZE];
+
+    portENTER_CRITICAL(&wheelLock);
+    uint32_t wheelPulseTotal = wheelPulses.total;
+    uint8_t  count           = copyWheelPulses(wheelPulses, recentUs);
+    portEXIT_CRITICAL(&wheelLock);
+
+    // Clock read after the copy, so it is never earlier than the newest pulse.
+    uint16_t speed = wheelSpeedMmS(recentUs, count, (uint64_t)esp_timer_get_time());
+
     SeederTelemetry telemetry;
     fillHeader(telemetry.header, MsgType::SeederTelemetry, NodeId::Seeder, links.flags());
 
@@ -205,8 +147,8 @@ static void sendTelemetry(uint32_t nowMs)
     telemetry.wheelPulses     = wheelPulseTotal;
     telemetry.turbineRPM      = turbineRPM;
     telemetry.womRPM          = 540;   // placeholder until a real WOM sensor exists
-    telemetry.groundSpeedMmS  = groundSpeedMmS;
-    telemetry.wheelTurning    = wheelIsTurning(nowMs) ? 1 : 0;
+    telemetry.groundSpeedMmS  = speed;
+    telemetry.wheelTurning    = (speed > 0) ? 1 : 0;
     telemetry.tramlineRelayOn = (digitalRead(RELAY_PIN) == RELAY_ON) ? 1 : 0;
 
     broadcast(&telemetry, sizeof(telemetry), nowMs);
@@ -220,11 +162,11 @@ void setup()
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, RELAY_OFF);
 
-    pinMode(TURBINE_INDUCTIVE_SENSOR_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(TURBINE_INDUCTIVE_SENSOR_PIN), turbinePulseISR, RISING);
+    pinMode(TURBINE_SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(TURBINE_SENSOR_PIN), turbinePulseISR, RISING);
 
-    pinMode(WHEEL_HALL_SENSOR_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(WHEEL_HALL_SENSOR_PIN), wheelPulseISR, RISING);
+    pinMode(WHEEL_SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(WHEEL_SENSOR_PIN), wheelPulseISR, RISING);
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -257,9 +199,7 @@ void setup()
         return;
     }
 
-    uint32_t now = millis();
-    turbineSnapshotMs = now;
-    wheelSnapshotMs   = now;
+    turbineSnapshotMs = millis();
 
     Serial.println("Seeder module ready");
 }
@@ -269,7 +209,6 @@ void loop()
     uint32_t now = millis();
 
     updateTurbineRPM(now);
-    updateGroundSpeed(now);
     applyRelay();
     sendTelemetry(now);
 }

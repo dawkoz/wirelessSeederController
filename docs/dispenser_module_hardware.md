@@ -3,8 +3,8 @@
 Everything needed to build the third (fertilizer dispenser) module. The motor
 driver and motor are already chosen; the rest is the supporting hardware.
 
-Firmware pin assignments come from `src/dispenser/main.cpp` — if you change a
-pin here, change it there too.
+Firmware pin assignments come from `include/machine_settings.h` — if you change
+a pin here, change it there too.
 
 ---
 
@@ -78,7 +78,7 @@ standard DevKit.
 
 Worth a ten-second look at your actual board anyway: if you can see a small
 crystal near those two pins, move the encoder to GPIO 18/19 and update
-`ENCODER_A_PIN` / `ENCODER_B_PIN` in `src/dispenser/main.cpp`.
+`ENCODER_A_PIN` / `ENCODER_B_PIN` in `include/machine_settings.h`.
 
 ### 2.3 Boot-time floating — the reason for the pull-down resistors
 
@@ -215,7 +215,7 @@ the encoder inputs and corrupts the count.
 5. First power-up: hopper empty, coupling disconnected from the auger. Confirm
    the motor turns and the encoder counts before loading it.
 6. If the auger runs the wrong way, either swap the motor's red and black leads
-   or flip `MOTOR_DIR_FORWARD` in `src/dispenser/main.cpp`.
+   or flip `MOTOR_DIR_FORWARD` in `include/machine_settings.h`.
 
 ## 5. First calibration
 
