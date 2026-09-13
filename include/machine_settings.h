@@ -82,6 +82,9 @@ static constexpr uint8_t OLED_I2C_ADDRESS = 0x3C;
 
 static constexpr uint32_t BUTTON_DEBOUNCE_MS   = 50;
 static constexpr uint32_t BUTTON_LONG_PRESS_MS = 1500;
+// A press counts only if its screen was already showing this long before the
+// press began - faster than a person can react to a new screen.
+static constexpr uint32_t BUTTON_SCREEN_SETTLE_MS = 250;
 
 // --- Tramlines --------------------------------------------------------------
 
@@ -95,6 +98,12 @@ static constexpr bool     ENABLE_WOM_ALARM        = false;   // no WOM sensor ye
 static constexpr uint16_t TURBINE_RUNNING_MIN_RPM = 50;      // below this the turbine counts as stopped
 static constexpr uint16_t WOM_RUNNING_MIN_RPM     = 50;      // below this the WOM counts as stopped
 static constexpr uint32_t LINK_BUZZER_DELAY_MS    = 5000;    // a lost link beeps only after this long
+
+// --- Calibration run --------------------------------------------------------
+
+// After START, the dispenser not calibrating for this long means the run was
+// interrupted.
+static constexpr uint32_t CALIBRATION_START_TIMEOUT_MS = 2000;
 
 // --- First-boot values, until changed on the Dawka and Kalibracja screens ---
 
@@ -135,12 +144,31 @@ static constexpr float    MOTOR_KP                  = 0.8f;
 static constexpr float    MOTOR_KI                  = 0.4f;
 static constexpr float    MOTOR_INTEGRAL_LIMIT      = 400.0f;
 
-// --- Stall alarm ------------------------------------------------------------
+// --- Clog alarm -------------------------------------------------------------
 
-// Raised when the shaft turns slower than STALL_RPM_THRESHOLD while the motor
-// has been driven for at least STALL_TIMEOUT_MS.
-static constexpr uint32_t STALL_TIMEOUT_MS    = 1500;
-static constexpr uint16_t STALL_RPM_THRESHOLD = 5;
+// Clogged when the shaft turns slower than CLOG_MIN_SPEED_PERCENT of the
+// commanded speed for CLOG_DETECT_MS while the motor is meant to be turning.
+static constexpr uint32_t CLOG_DETECT_MS         = 1500;
+static constexpr uint32_t CLOG_MIN_SPEED_PERCENT = 33;
+
+// The tractor sounds the alarm again only after it has seen the dispenser out
+// of Clogged, or lost contact with it. A new clog takes at least CLOG_DETECT_MS
+// of normal running, so it can never slip in between two packets unseen.
+static_assert(CLOG_DETECT_MS > LINK_TIMEOUT_MS + SEND_INTERVAL_MS,
+              "CLOG_DETECT_MS must be longer than LINK_TIMEOUT_MS + SEND_INTERVAL_MS");
+
+// --- Unclogging (Odetkaj on the tractor) ------------------------------------
+
+static constexpr uint16_t UNCLOG_PERMILLE   = 1000;   // full torque; lower it if the gearbox or the supply suffers
+static constexpr uint32_t UNCLOG_REVERSE_MS = 800;
+static constexpr uint32_t UNCLOG_FORWARD_MS = 800;
+static constexpr uint32_t UNCLOG_PAUSE_MS   = 200;    // motor off after each move, so it never reverses at speed
+static constexpr uint32_t UNCLOG_CYCLES     = 2;      // one cycle: reverse, pause, forward, pause
+static constexpr uint32_t UNCLOG_CYCLE_MS   = UNCLOG_REVERSE_MS + UNCLOG_PAUSE_MS + UNCLOG_FORWARD_MS + UNCLOG_PAUSE_MS;
+static constexpr uint32_t UNCLOG_TOTAL_MS   = UNCLOG_CYCLES * UNCLOG_CYCLE_MS;   // 4000
+
+static_assert(UNCLOG_PAUSE_MS >= 2 * MOTOR_CONTROL_INTERVAL_MS,
+              "UNCLOG_PAUSE_MS must span at least two control steps");
 
 // --- Calibration run --------------------------------------------------------
 

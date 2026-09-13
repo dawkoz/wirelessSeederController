@@ -28,7 +28,10 @@ static constexpr uint8_t PROTOCOL_MAGIC_1 = 'S';
 // that don't match, so a half-updated set of boards fails loudly instead of
 // quietly misreading each other.
 // v3: added dispenser on/off and the automated calibration run.
-static constexpr uint8_t PROTOCOL_VERSION = 3;
+// v4: clog alarm and unclogging - DispenserMode replaces the old calibration
+//     state enum, TractorCommand carries counters for Anuluj/Odetkaj and the
+//     tractor's upTimeMs.
+static constexpr uint8_t PROTOCOL_VERSION = 4;
 
 static const uint8_t BROADCAST_ADDRESS[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -54,18 +57,18 @@ static constexpr uint8_t LINK_HEARD_DISPENSER = 1 << 2;
 enum class DispenserFault : uint8_t {
     None        = 0,
     NoSpeedData = 1,  // seeder unheard, cannot meter at all
-    Stalled     = 2,  // motor commanded but the shaft is not turning
-    OverSpeed   = 3,  // required RPM is beyond what the motor can deliver
+    OverSpeed   = 2,  // required RPM is beyond what the motor can deliver
 };
 
-// Automated calibration: the dispenser turns its output shaft exactly
-// CALIBRATION_REVOLUTIONS times so the operator can catch and weigh the
-// output instead of turning the shaft by hand.
-enum class CalibrationState : uint8_t {
-    Idle    = 0,
-    Running = 1,
-    Done    = 2,
-    Refused = 3,   // machine was moving, so starting a run would be unsafe
+// What the dispenser is doing. DispenserStatus.faultCode is only meaningful
+// in Normal.
+enum class DispenserMode : uint8_t {
+    Normal          = 0,   // metering to ground speed (motor off while not moving, off, or no seeder)
+    Calibrating     = 1,   // automated calibration run turning the shaft
+    CalibrationDone = 2,   // run finished, motor off, until the tractor withdraws the request
+    Refused         = 3,   // run refused or stopped because the machine is moving
+    Clogged         = 4,   // shaft blocked, motor off, waiting for Anuluj or Odetkaj
+    Unclogging      = 5,   // running the reverse/forward sequence
 };
 
 struct __attribute__((packed)) MessageHeader {
@@ -106,19 +109,30 @@ struct __attribute__((packed)) TractorCommand {
     uint16_t doseKgPerHa;
     uint32_t gramsPer100Rev;     // dispenser calibration, broadcast so the
                                  // dispenser never holds its own copy
+    uint32_t upTimeMs;           // tractor millis(); a smaller value than last
+                                 // time means it rebooted
+    uint8_t  clogClearSeq;       // +1 each time the operator picks Anuluj on the clog screen
+    uint8_t  unclogSeq;          // +1 each time the operator picks Odetkaj
+    // clogClearSeq/unclogSeq are counters, not flags or one-packet pulses: a
+    // flag held high would repeat the action on every packet, and a pulse sent
+    // once is lost with one dropped packet. A counter repeated in every packet
+    // survives loss and is acted on exactly once per change. The dispenser
+    // ignores a change that arrives right after a link gap or a tractor reboot
+    // (the resync rule in dispenser_logic.h), so it never acts on boot.
 };
-static_assert(sizeof(TractorCommand) == 18, "TractorCommand layout changed - reflash ALL boards");
+static_assert(sizeof(TractorCommand) == 24, "TractorCommand layout changed - reflash ALL boards");
 
 // Dispenser -> everyone
 struct __attribute__((packed)) DispenserStatus {
-    MessageHeader    header;
-    uint16_t         targetShaftRPM;
-    uint16_t         measuredShaftRPM;
-    uint16_t         motorCommandedPermille;   // 0..1000
-    uint8_t          motorRunning;
-    DispenserFault   faultCode;
-    CalibrationState calibrationState;
-    uint8_t          calibrationPercent;       // 0..100
+    MessageHeader  header;
+    uint16_t       targetShaftRPM;
+    uint16_t       measuredShaftRPM;
+    uint16_t       motorCommandedPermille;   // 0..1000
+    uint8_t        motorRunning;
+    DispenserFault faultCode;
+    DispenserMode  mode;
+    uint8_t        progressPercent;   // 0..100 while Calibrating or Unclogging,
+                                      // 100 in CalibrationDone, 0 otherwise
 };
 static_assert(sizeof(DispenserStatus) == 18, "DispenserStatus layout changed - reflash ALL boards");
 
@@ -140,6 +154,18 @@ inline void fillHeader(MessageHeader &header, MsgType type, NodeId sender, uint8
     header.reserved  = 0;
 }
 
+// Which sender may send which message type. Validity includes this, so a
+// mislabelled packet can never mark a board alive or reach the packet copies.
+inline bool senderMatchesType(MsgType type, NodeId sender)
+{
+    switch (type) {
+        case MsgType::SeederTelemetry: return sender == NodeId::Seeder;
+        case MsgType::TractorCommand:  return sender == NodeId::Tractor;
+        case MsgType::DispenserStatus: return sender == NodeId::Dispenser;
+        default:                       return false;
+    }
+}
+
 // Every receive path must call this before copying anything out of the buffer.
 // Checking the length is what stops a packet of the wrong size being memcpy'd
 // past the end of the incoming data.
@@ -155,7 +181,8 @@ inline bool headerValid(const uint8_t *data, int len, MsgType expectedType, size
         && header.magic1    == PROTOCOL_MAGIC_1
         && header.version   == PROTOCOL_VERSION
         && header.networkId == NETWORK_ID
-        && header.type      == expectedType;
+        && header.type      == expectedType
+        && senderMatchesType(header.type, header.sender);
 }
 
 // Tracks when each peer was last heard from. Lives here so all three boards
