@@ -119,7 +119,7 @@ static constexpr uint32_t DEFAULT_GRAMS_PER_100REV = 500;
 
 static constexpr uint8_t MOTOR_PWM_PIN = 25;   // needs a 10k pull-down to GND
 static constexpr uint8_t MOTOR_DIR_PIN = 26;   // needs a 10k pull-down to GND
-static constexpr uint8_t ENCODER_A_PIN = 32;   // encoder fed 5 V, divided to 3.3 V: 12 V here destroys the board
+static constexpr uint8_t ENCODER_A_PIN = 32;   // encoder fed 5 V, through the BSS138 level shifter: 12 V here destroys the board
 static constexpr uint8_t ENCODER_B_PIN = 33;   // wired, not used
 
 static constexpr uint8_t MOTOR_DIR_FORWARD = LOW;   // change to HIGH if the auger turns the wrong way

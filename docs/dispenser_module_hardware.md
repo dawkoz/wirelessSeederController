@@ -85,7 +85,7 @@ Allegro don't have.
    the 37D encoder board (10 kΩ on their comparable 25D encoders). The 10 k /
    20 k divider in the earlier draft then gives about 2.5 V, which the ESP32
    may or may not read as high — miscounted edges, and so a wrong dose. Use the
-   BSS138 module (item 5) and check it with §4 step 2.
+   BSS138 module (item 5) and check it with §4 step 6.
 3. **Motor power arrives on a 0.1″ header.** All six 20 cm leads, the red and
    black motor power included, end in one 1×6 female 0.1″ header. That is fine
    for the encoder, not for up to 5.5 A: cut the red and black leads out of it
@@ -311,24 +311,41 @@ the encoder inputs and corrupts the count.
 
 ---
 
-## 4. Before powering up
+## 4. Before the first motor run
 
 1. **Check the encoder's blue wire goes to 5 V, not 12 V.** This is the one
    mistake that destroys the ESP32 — the encoder's outputs sit at its Vcc.
-2. With the 5 V and 3.3 V supplies on, turn the output shaft slowly by hand
-   and measure `LV1` and `LV2`: each must swing between about 0 V and 3.3 V —
-   never 5 V, and never stuck around 2.5 V.
-3. Confirm the two 10 kΩ pull-downs are present on PWM and DIR (§2.3).
-4. Confirm continuity from ESP32 GND to MD13S GND before applying 12 V.
-5. Check the polarity of the protection parts with the multimeter's diode test
+2. Confirm the two 10 kΩ pull-downs are present on PWM and DIR (§2.3).
+3. Confirm continuity from ESP32 GND to MD13S GND before applying 12 V.
+4. Check the polarity of the protection parts with the multimeter's diode test
    before the first 12 V: the MBR1045 conducts from the connector towards the
    12 V rail, and the TVS's band faces +12 V. A reversed TVS shorts the rail
    and blows the fuse.
-6. Power the ESP32 from **one source only** (§1.5 trap 6): with USB plugged in,
+5. Power the ESP32 from **one source only** (§1.5 trap 6): with USB plugged in,
    the regulator's 5 V stays off the ESP32 `5V` pin.
-7. First power-up: hopper empty, coupling disconnected from the auger. Confirm
-   the motor turns and the encoder counts before loading it. **The bench test
-   image in §6 does exactly this, automatically** — flash that first.
+6. **Check the encoder signals with a multimeter before `LV1`/`LV2` go to
+   GPIO 32/33.** Coupling off the auger, ESP32 on USB, 12 V on — the
+   pull-downs keep the motor still. The high level on the LV side comes from
+   the module's `LV` pin, not from the encoder: with no 3.3 V on `LV`, `LV1`
+   never goes high, and a meter reads it as about 0–0.1 V.
+   - `LV` to GND reads 3.3 V, `HV` to GND 5 V, and blue to green at the motor's
+     header 5 V. Measure on the module's own pins — its header is soldered by
+     hand.
+   - Turn the output shaft a few degrees one way, let go, read `HV1`; repeat
+     about ten times. The level changes every 0.4° of the output shaft, so even
+     slow turning is far too fast for a meter — read only with the shaft still.
+     About half the stops read ~5 V and the rest ~0 V.
+   - At each stop `LV1` reads ~3.3 V where `HV1` read ~5 V, and ~0 V where it
+     read ~0 V — never 5 V, never ~2.5 V. Then the same for `HV2`/`LV2`.
+   - `HV1` never high: take yellow off `HV1` and measure the bare wire the same
+     way. If it now changes, the fault is on the module side — a solder joint,
+     a short, or something holding `LV1` low (the module passes a low in both
+     directions). If it still never goes high, the encoder has no supply, the
+     wires don't match §3.3, or the encoder is damaged.
+7. First motor run: hopper empty, coupling off the auger. **The bench test
+   image in §6 does this automatically** — flash it first. Its H02 counts every
+   encoder edge while you turn the shaft by hand, a far better check than a
+   meter.
 8. If the auger runs the wrong way, either swap the motor's red and black leads
    or flip `MOTOR_DIR_FORWARD` in `include/machine_settings.h`.
 
@@ -419,6 +436,13 @@ The summary prints the measured values worth copying into
 - **`MOTOR_MAX_RPM`** — H03 measures the shaft RPM at full duty.
 - **which channel A level means forward** — H04 separates the directions with
   channel B and asks you to confirm the forward run dispenses.
+
+On the bench, H03 and H05 turn a free shaft, but `MOTOR_MAX_RPM` and
+`MOTOR_MIN_RUNNING_PERMILLE` belong to the loaded auger at the tractor's
+voltage. Measure those two again on the machine: bench image flashed, auger
+coupled, fertilizer in the hopper, a bucket under the outlet, engine running,
+then `h` with H02 and H06 skipped. The dose after every stop depends on
+`MOTOR_MAX_RPM` being right (CLAUDE.md, Future tasks).
 
 ### Afterwards
 

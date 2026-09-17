@@ -607,6 +607,10 @@ static void runCalibrationTests()
         bool refused = pollUntil(300, []() { return logic.mode == DispenserMode::Refused; });
         if (abortRequested) { reportLine("C04", Outcome::Aborted, "aborted by key"); return; }
 
+        // The machine was moving with the dispenser on, so it metered until
+        // Refused stopped it: let the shaft stop before counting.
+        if (!runFor(500)) { reportLine("C04", Outcome::Aborted, "aborted by key"); return; }
+
         Window w;
         if (!runWindow(3000, w)) { reportLine("C04", Outcome::Aborted, "aborted by key"); return; }
 

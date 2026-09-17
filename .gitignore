@@ -17,3 +17,6 @@ obj
 build
 .elf
 .bin
+.test-results
+
+docs/book

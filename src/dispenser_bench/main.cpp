@@ -319,8 +319,6 @@ static bool benchPrepare()
     encoderBegin();             // a K test detaches channel A; always re-attach it
     dispenserResetInbox();
     injectorSilence(injector);
-    dispenserInit(logic, millis(), encoderEdges());
-    lastPrintedMode = logic.mode;
 
     // The watch flags describe the test that set them, never the one running
     // now: M03-M05 read gSawClogged, and a flag left over from a K test would
@@ -330,7 +328,15 @@ static bool benchPrepare()
     gSawBuzzingDuty = false;
     gSawClogged     = false;
 
-    return motorWait(1000);
+    if (!motorWait(1000)) return false;
+
+    // The logic starts after the wait, so its first control step covers one
+    // normal interval, as in production. Started before the wait, that step
+    // spanned the whole second, and its integral kick held M02 about 10 % over
+    // the target for the next few seconds.
+    dispenserInit(logic, millis(), encoderEdges());
+    lastPrintedMode = logic.mode;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

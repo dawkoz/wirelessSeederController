@@ -23,7 +23,7 @@ A wireless controller for a Kverneland Accord-style seeder, mimicking the Kverne
 
 - **Seeder module** (on the seeder): turbine RPM sensor, ground-wheel sensor (ground speed and "is the seeder moving"), tramline relay.
 - **Tractor module** (in the cab): OLED display, one button that drives every screen, LEDs and buzzer. Owns the tramline selection and the dispenser settings.
-- **Dispenser module** (on the seeder): fertilizer dispenser motor driven through a Cytron motor driver, metered from the seeder's ground speed. A separate board for one reason only — the seeder's enclosure has no room left. It gets its own 12 V power cable; everything else is wireless like the other two boards. **Firmware written, hardware not built yet.**
+- **Dispenser module** (on the seeder): fertilizer dispenser motor driven through a Cytron motor driver, metered from the seeder's ground speed. A separate board for one reason only — the seeder's enclosure has no room left. It gets its own 12 V power cable; everything else is wireless like the other two boards. **Built and bench-tested, not yet fitted to the machine.**
 
 ## Philosophy
 
@@ -39,7 +39,7 @@ Read this before changing anything.
 
 - **`GPIO12` is the MTDI strapping pin** — its level at reset selects the flash voltage, and held high at reset the chip configures 1.8 V flash and **fails to boot**. Both existing boards use it (seeder relay, tractor button) and both work today because the pin sits low at reset. Nothing needs changing, but **never add an external pull-up to GPIO12**, and if the relay module is ever swapped for one with a pull-up on its input, expect a board that no longer boots.
 - **No MAC addresses anywhere.** All three boards transmit to the ESP-NOW broadcast address and filter incoming packets by the `type`/`sender` fields in `MessageHeader`. A physical ESP32 can be swapped for a new one with **no firmware change on any board**.
-- ESP-NOW runs on a fixed `ESPNOW_CHANNEL` (1) with power save disabled, set identically on all three boards in `setup()`. `encrypt` is `false` — required, since ESP-NOW encryption needs per-peer keys and is incompatible with broadcast addressing (see Rejected ideas). The registered peer uses `channel = 0` ("current radio channel") deliberately: naming the channel on both the radio and the peer creates a way for them to disagree, and a mismatch makes *every* `esp_now_send()` fail. Send failures are counted and logged on serial rather than discarded.
+- ESP-NOW runs on a fixed `ESPNOW_CHANNEL` (1) with power save disabled, set identically on all three boards in `setup()`. `encrypt` is `false` — required, since ESP-NOW encryption needs per-peer keys and is incompatible with broadcast addressing (see Rejected ideas). The registered peer uses `channel = 0` ("current radio channel") deliberately: naming the channel on both the radio and the peer creates a way for them to disagree, and a mismatch makes _every_ `esp_now_send()` fail. Send failures are counted and logged on serial rather than discarded.
 - **Any change to `include/espnow_protocol.h` means reflashing all three boards.** Bump `PROTOCOL_VERSION` when you do — receivers drop mismatched packets, so a half-updated set of boards fails loudly instead of quietly misreading each other. The `static_assert`s on every struct turn an accidental layout change into a build error.
 - **The dispenser writes PWM 0 before anything else in `setup()`** — keep it the first thing. The 10 kΩ pull-downs on the driver inputs cover the time before that (reset and boot).
 - **The tractor calls `Wire.setClock(400000)` after `oled.begin()` — leave it there.** The vendored SH1106 library set the same speed via the AVR `TWBR` register, which had to be removed for the ESP32 port. Without it the bus runs at Arduino's default 100 kHz, a full redraw takes ~103 ms instead of ~26 ms, and since the button is polled once per `loop()` it starts dropping presses.
@@ -66,16 +66,20 @@ docs/dispenser_module_hardware.md   dispenser parts list, pin verification, wiri
 Why one project with multiple envs, instead of three separate PlatformIO projects: it lets `include/espnow_protocol.h` be physically the same file for every board that needs it, so the protocol can't silently drift between boards the way it could with copy-pasted struct definitions (which is how this repo worked before the PlatformIO migration — each `.ino` had its own copy).
 
 **To build/upload a specific board:**
+
 ```bash
 pio run -e tractor -t upload
 pio run -e seeder -t upload
 pio run -e dispenser -t upload
 ```
+
 The bench test image is a fourth environment, uploaded to the dispenser module on the workbench only:
+
 ```bash
 pio run -e dispenser_bench -t upload
 pio device monitor -e dispenser_bench
 ```
+
 Or in VS Code: pick the environment from the PlatformIO status bar at the bottom, or the Project Tasks tree in the PlatformIO sidebar. On the development PC `pio` is not on PATH from a plain shell — see [How to work on a task](#how-to-work-on-a-task) for the full path.
 
 **Platform version is pinned** in `platformio.ini` (`espressif32@7.0.1`, Arduino-ESP32 core 2.0.17) deliberately. Arduino-ESP32 3.x (ESP-IDF 5) changes the ESP-NOW receive-callback signature (`OnDataRecv` gains an `esp_now_recv_info_t*` parameter) — bumping past the 2.x line will break the builds until the callbacks are rewritten. Don't bump this without checking ESP-NOW API changes first. The core compiles C++ as **`-std=gnu++11`** (GCC 8.4).
@@ -85,34 +89,37 @@ Or in VS Code: pick the environment from the PlatformIO status bar at the bottom
 All pin numbers below are set in `include/machine_settings.h`.
 
 ### Seeder ESP32 (`src/seeder/main.cpp`)
-| Pin | Function |
-|---|---|
-| 12 | Relay control (tramline), active LOW |
-| 14 | Turbine inductive sensor (interrupt, RISING) |
-| 27 | Ground-wheel Hall sensor, 3 magnets (interrupt, RISING) |
+
+| Pin | Function                                                |
+| --- | ------------------------------------------------------- |
+| 12  | Relay control (tramline), active LOW                    |
+| 14  | Turbine inductive sensor (interrupt, RISING)            |
+| 27  | Ground-wheel Hall sensor, 3 magnets (interrupt, RISING) |
 
 The pin 27 sensor sits on the ground wheel **before** the seed-rate gearbox, so it measures distance travelled regardless of the seed rate setting. It is the source for both "is the seeder moving" and ground speed — see `WHEEL_MM_PER_PULSE` in `include/machine_settings.h`, which is **an estimate until measured** (628 mm: a 60 cm wheel with 3 magnets).
 
 ### Tractor ESP32 (`src/tractor/main.cpp`)
-| Pin | Function |
-|---|---|
-| 12 | The button (to GND) |
-| 14 | Green LED (connected) |
-| 27 | Blue LED (connecting/blinking) |
-| 13 | Yellow LED (tramline active) |
-| 19 | Buzzer |
 
-OLED: SH1106 128x64 over I2C, address `0x3C`. The single button drives every screen (see [Tractor screens](#tractor-screens)): short press < 1500 ms, long press fires *at* 1500 ms while still held.
+| Pin | Function                       |
+| --- | ------------------------------ |
+| 12  | The button (to GND)            |
+| 14  | Green LED (connected)          |
+| 27  | Blue LED (connecting/blinking) |
+| 13  | Yellow LED (tramline active)   |
+| 19  | Buzzer                         |
+
+OLED: SH1106 128x64 over I2C, address `0x3C`. The single button drives every screen (see [Tractor screens](#tractor-screens)): short press < 1500 ms, long press fires _at_ 1500 ms while still held.
 
 ### Dispenser ESP32 (`src/dispenser/main.cpp`)
-Firmware written, hardware not yet built. **Cytron MD13S** driver (PWM + DIR, 13 A continuous) and a **Pololu 4752** motor (37Dx68L, 30:1, 12 V, 330 RPM, 14 kg·cm, 5.5 A stall) with a built-in quadrature encoder (64 CPR motor shaft → 1920 CPR output shaft). Powered by its own 12 V line; control/telemetry wireless like the other two boards.
 
-| Pin | Function |
-|---|---|
-| 25 | MD13S PWM (LEDC, 16 kHz) |
-| 26 | MD13S DIR |
-| 32 | Encoder channel A (interrupt, RISING) |
-| 33 | Encoder channel B (wired, unused by the production firmware) |
+Built and bench-tested, not yet fitted to the machine. **Cytron MD13S** driver (PWM + DIR, 13 A continuous) and a **Pololu 4752** motor (37Dx68L, 30:1, 12 V, 330 RPM, 14 kg·cm, 5.5 A stall) with a built-in quadrature encoder (64 CPR motor shaft → 1920 CPR output shaft). Powered by its own 12 V line; control/telemetry wireless like the other two boards.
+
+| Pin | Function                                                     |
+| --- | ------------------------------------------------------------ |
+| 25  | MD13S PWM (LEDC, 16 kHz)                                     |
+| 26  | MD13S DIR                                                    |
+| 32  | Encoder channel A (interrupt, RISING)                        |
+| 33  | Encoder channel B (wired, unused by the production firmware) |
 
 `ENCODER_EDGES_PER_REV` is set to 480 — confirmed against Pololu's documentation: "64 CPR" counts both edges of both channels, so one channel's rising edges give 64 ÷ 4 = 16 per motor revolution, × 30:1 = 480 per output revolution. Still **verify by hand-turning the output shaft 10 revolutions** before trusting the rate control. Counting one channel cannot tell direction: the count goes **up** whichever way the shaft turns.
 
@@ -220,23 +227,23 @@ Screens 7–11 are one screen. Its content changes by itself as the dispenser re
 
 ### What each screen does
 
-| Screen | Content | Short press | Long press |
-|---|---|---|---|
-| 1 Menu | `Praca`, `Dawka`, `Kalibracja`, `Sciezki`. Starts on `Praca`, then stays on the item last opened | next item | open it |
-| 2 Work | turbine RPM, ground speed, dispenser setting (`DOZ:WYL.` or the dose), pass number 1–6 in large digits. While tramlines are off, `Sciezki: WYL.` sits where `Przejazd:` and the pass number were. The `BRAK:` line appears only while a link is down: `S` seeder, `D` dispenser (only after it has been heard once), `S-D` seeder and dispenser can't hear each other | next pass, 6 → 1 (nothing while tramlines are off) | back to 1 |
-| 3 Fault | `DOZOWNIK ZA SZYBKO` (driving faster than the dispenser can keep up with; only while the dispenser is heard — a silent dispenser is announced by `BRAK: D` instead) | nothing (the pass number is hidden, so it must not change blind) | back to 1 |
-| 4 Dose editor | dose in kg/ha, `WL./WYL.`, `ZAPISZ` | see Editors | see Editors |
-| 5 Calibration editor | grams per 100 dispenser revolutions, `TEST`, `ZAPISZ` | see Editors | see Editors |
-| 6 Confirm | `Anuluj` (preselected) or `START` | switch | `Anuluj` → 5, `START` → 7 |
-| 7 Running | progress of the 100-revolution run | ignored | cancel the run → 5 |
-| 8 Done | weigh the output and enter it in grams | → 5 | → 5 |
-| 9 Machine moving | run refused or stopped, because the seeder reports the wheel turning | → 5 | → 5 |
-| 10 No dispenser | dispenser not heard | ignored | cancel the run → 5 |
-| 11 Interrupted | dispenser stayed in Normal after START instead of calibrating, for `CALIBRATION_START_TIMEOUT_MS` — its side dropped the run (reboot, link gap, clog, cancel) | → 5 | → 5 |
-| 12 Clog alarm | `ZATKANIE!` / `DOZOWNIKA` / `[OK]`, over any screen, with the buzzer | acknowledge → 13 | acknowledge → 13 |
-| 13 Clog choice | `Anuluj` (preselected) / `Odetkaj`, buzzer silent | switch | `Anuluj` → screen underneath, `Odetkaj` → 14 |
-| 14 Unclogging | progress of the reverse/forward sequence, over any screen | ignored | ignored |
-| 15 Tramlines | `SCIEZKI`, the switch `WL.`/`WYL.`, `ZAPISZ` | move the cursor | switch: flip it and store it straight away; `ZAPISZ`: → 1 |
+| Screen               | Content                                                                                                                                                                                                                                                                                                                                                               | Short press                                                      | Long press                                                |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------- |
+| 1 Menu               | `Praca`, `Dawka`, `Kalibracja`, `Sciezki`. Starts on `Praca`, then stays on the item last opened                                                                                                                                                                                                                                                                      | next item                                                        | open it                                                   |
+| 2 Work               | turbine RPM, ground speed, dispenser setting (`DOZ:WYL.` or the dose), pass number 1–6 in large digits. While tramlines are off, `Sciezki: WYL.` sits where `Przejazd:` and the pass number were. The `BRAK:` line appears only while a link is down: `S` seeder, `D` dispenser (only after it has been heard once), `S-D` seeder and dispenser can't hear each other | next pass, 6 → 1 (nothing while tramlines are off)               | back to 1                                                 |
+| 3 Fault              | `DOZOWNIK ZA SZYBKO` (driving faster than the dispenser can keep up with; only while the dispenser is heard — a silent dispenser is announced by `BRAK: D` instead)                                                                                                                                                                                                   | nothing (the pass number is hidden, so it must not change blind) | back to 1                                                 |
+| 4 Dose editor        | dose in kg/ha, `WL./WYL.`, `ZAPISZ`                                                                                                                                                                                                                                                                                                                                   | see Editors                                                      | see Editors                                               |
+| 5 Calibration editor | grams per 100 dispenser revolutions, `TEST`, `ZAPISZ`                                                                                                                                                                                                                                                                                                                 | see Editors                                                      | see Editors                                               |
+| 6 Confirm            | `Anuluj` (preselected) or `START`                                                                                                                                                                                                                                                                                                                                     | switch                                                           | `Anuluj` → 5, `START` → 7                                 |
+| 7 Running            | progress of the 100-revolution run                                                                                                                                                                                                                                                                                                                                    | ignored                                                          | cancel the run → 5                                        |
+| 8 Done               | weigh the output and enter it in grams                                                                                                                                                                                                                                                                                                                                | → 5                                                              | → 5                                                       |
+| 9 Machine moving     | run refused or stopped, because the seeder reports the wheel turning                                                                                                                                                                                                                                                                                                  | → 5                                                              | → 5                                                       |
+| 10 No dispenser      | dispenser not heard                                                                                                                                                                                                                                                                                                                                                   | ignored                                                          | cancel the run → 5                                        |
+| 11 Interrupted       | dispenser stayed in Normal after START instead of calibrating, for `CALIBRATION_START_TIMEOUT_MS` — its side dropped the run (reboot, link gap, clog, cancel)                                                                                                                                                                                                         | → 5                                                              | → 5                                                       |
+| 12 Clog alarm        | `ZATKANIE!` / `DOZOWNIKA` / `[OK]`, over any screen, with the buzzer                                                                                                                                                                                                                                                                                                  | acknowledge → 13                                                 | acknowledge → 13                                          |
+| 13 Clog choice       | `Anuluj` (preselected) / `Odetkaj`, buzzer silent                                                                                                                                                                                                                                                                                                                     | switch                                                           | `Anuluj` → screen underneath, `Odetkaj` → 14              |
+| 14 Unclogging        | progress of the reverse/forward sequence, over any screen                                                                                                                                                                                                                                                                                                             | ignored                                                          | ignored                                                   |
+| 15 Tramlines         | `SCIEZKI`, the switch `WL.`/`WYL.`, `ZAPISZ`                                                                                                                                                                                                                                                                                                                          | move the cursor                                                  | switch: flip it and store it straight away; `ZAPISZ`: → 1 |
 
 ### Editors (4 and 5)
 
@@ -262,13 +269,13 @@ The dispenser's decision logic lives in `src/dispenser/dispenser_logic.h` — a 
 
 **Modes.** `DispenserStatus.faultCode` is only meaningful in Normal:
 
-| Mode | What one step does | Leaves when |
-|---|---|---|
-| Normal | A calibration request (alive tractor, `calibrationRun` 1, armed) → `Refused` if the seeder reports the wheel turning, else `Calibrating`, motor off either way. Otherwise meters: no seeder → fault `NoSpeedData`, motor off. Not moving, speed 0, dispenser off or dose 0 → fault `None`, motor off. Else target = `requiredShaftRPM(speed, dose, calib)`, clamped to `MOTOR_MAX_RPM` (fault `OverSpeed`), duty from the controller, clog check. The tractor being gone is ignored on purpose — the last dose is held | clog detected → `Clogged` |
-| Calibrating | Tractor lost, no command or `calibrationRun` 0 → `Normal`, motor off. Seeder reports the wheel turning → `Refused`, motor off. `CALIBRATION_TOTAL_EDGES` edges turned → `CalibrationDone`, progress 100, motor off. Else progress from the edge count, target `CALIBRATION_RPM`, duty from the controller, clog check; fault `None` throughout | clog detected → `Clogged` |
-| CalibrationDone, Refused | Motor off | tractor alive and `calibrationRun` 0 → `Normal`. Nothing else leaves; the motor is off, so holding is safe |
-| Clogged | Motor off until the operator decides; calibration requests ignored | `clogClearSeq` change → `Normal`, motor off; `unclogSeq` change → `Unclogging`, first phase (reverse) output in that same step |
-| Unclogging | Phase from `t % UNCLOG_CYCLE_MS`: reverse `UNCLOG_PERMILLE` for `UNCLOG_REVERSE_MS`, pause (duty 0, forward) for `UNCLOG_PAUSE_MS`, forward `UNCLOG_PERMILLE` for `UNCLOG_FORWARD_MS`, pause; progress from `t / UNCLOG_TOTAL_MS`. No clog check — the encoder counts up in both directions, so it cannot be used here | `clogClearSeq` change → `Normal`, motor off; tractor lost or `UNCLOG_TOTAL_MS` elapsed → `Clogged`, motor off |
+| Mode                     | What one step does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Leaves when                                                                                                                    |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Normal                   | A calibration request (alive tractor, `calibrationRun` 1, armed) → `Refused` if the seeder reports the wheel turning, else `Calibrating`, motor off either way. Otherwise meters: no seeder → fault `NoSpeedData`, motor off. Not moving, speed 0, dispenser off or dose 0 → fault `None`, motor off. Else target = `requiredShaftRPM(speed, dose, calib)`, clamped to `MOTOR_MAX_RPM` (fault `OverSpeed`), duty from the controller, clog check. The tractor being gone is ignored on purpose — the last dose is held | clog detected → `Clogged`                                                                                                      |
+| Calibrating              | Tractor lost, no command or `calibrationRun` 0 → `Normal`, motor off. Seeder reports the wheel turning → `Refused`, motor off. `CALIBRATION_TOTAL_EDGES` edges turned → `CalibrationDone`, progress 100, motor off. Else progress from the edge count, target `CALIBRATION_RPM`, duty from the controller, clog check; fault `None` throughout                                                                                                                                                                         | clog detected → `Clogged`                                                                                                      |
+| CalibrationDone, Refused | Motor off                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | tractor alive and `calibrationRun` 0 → `Normal`. Nothing else leaves; the motor is off, so holding is safe                     |
+| Clogged                  | Motor off until the operator decides; calibration requests ignored                                                                                                                                                                                                                                                                                                                                                                                                                                                     | `clogClearSeq` change → `Normal`, motor off; `unclogSeq` change → `Unclogging`, first phase (reverse) output in that same step |
+| Unclogging               | Phase from `t % UNCLOG_CYCLE_MS`: reverse `UNCLOG_PERMILLE` for `UNCLOG_REVERSE_MS`, pause (duty 0, forward) for `UNCLOG_PAUSE_MS`, forward `UNCLOG_PERMILLE` for `UNCLOG_FORWARD_MS`, pause; progress from `t / UNCLOG_TOTAL_MS`. No clog check — the encoder counts up in both directions, so it cannot be used here                                                                                                                                                                                                 | `clogClearSeq` change → `Normal`, motor off; tractor lost or `UNCLOG_TOTAL_MS` elapsed → `Clogged`, motor off                  |
 
 **Clog check** (Normal and Calibrating only, and only while the controller is actually driving the motor — a step that leaves the duty at 0 is not a stall, so it stops the timer): shaft slower than `CLOG_MIN_SPEED_PERCENT` of the target for a continuous `CLOG_DETECT_MS` → `Clogged`: duty 0 forward in that same step, controller reset, progress 0, fault `None`. One step at speed stops the timer. The guard covers the case where a large negative integral (a motor running faster than the feed-forward expects, i.e. a tractor at ~14 V) has cancelled the feed-forward and the duty sits at 0 with the shaft stopped — that is not a clog, and the clamp in the controller is what stops it happening at all. It hides no real clog: a stopped shaft makes the error, and so the duty, positive.
 
@@ -276,7 +283,7 @@ The dispenser's decision logic lives in `src/dispenser/dispenser_logic.h` — a 
 
 ## Current tasks
 
-**No open tasks.** Tasks 1–4 (clog alarm and unclogging, tramline switch, dispenser bench test, review fixes) were reviewed and moved to [Completed](#completed). The next step is hardware: order and assemble the dispenser module ([docs/dispenser_module_hardware.md](docs/dispenser_module_hardware.md)), then run the bench test. Remaining work is in [Future tasks](#future-tasks).
+**No open tasks.** Tasks 1–4 (clog alarm and unclogging, tramline switch, dispenser bench test, review fixes) were reviewed and moved to [Completed](#completed). The dispenser module is assembled and has run the bench test; next it goes on the seeder ([docs/dispenser_module_hardware.md](docs/dispenser_module_hardware.md)). Remaining work, including what the bench run left untested, is in [Future tasks](#future-tasks).
 
 **Before any board goes on the machine:** protocol v4 changed the packet layout, so the tractor, the seeder and the dispenser must all be flashed from the same build. A board left on older firmware silently ignores the others.
 
@@ -291,19 +298,20 @@ The rules below apply to every new task written into this section.
    - All environments: the same without `-e ...`.
 
    Build only. Never run `-t upload`, `-t erase` or the serial monitor unless the user asks — no board is connected during these sessions, so **the compiler is the only automatic check you have**. Everything else depends on careful reading.
+
 3. **C++11 only** (`-std=gnu++11`, GCC 8.4): no `std::make_unique`, no inline variables, no structured bindings, no generic lambdas; a `constexpr` function may contain only a single `return` statement.
-4. **Match the existing style:** `static constexpr` constants in `include/machine_settings.h` (grouped by board, with a comment when the value needs explaining), `enum class ... : uint8_t`, comments that say *why*, no `String`, no dynamic allocation, no new libraries, fixed-width integer types in anything that goes on the wire.
+4. **Match the existing style:** `static constexpr` constants in `include/machine_settings.h` (grouped by board, with a comment when the value needs explaining), `enum class ... : uint8_t`, comments that say _why_, no `String`, no dynamic allocation, no new libraries, fixed-width integer types in anything that goes on the wire.
 5. **UI text is Polish without diacritics** (the built-in font has no Polish letters: `WYL.` not `WYŁ.`). Use the strings exactly as the task gives them. The built-in font is 6×8 px per character × text size, and text wraps to the next line silently: from x = 0 a line holds 21 characters at size 1, 10 at size 2, 7 at size 3, 5 at size 4.
 6. **Don't touch** what the task doesn't list: the platform pin in `platformio.ini`, `lib/Adafruit_SH1106/`, pin numbers, the seeder's behaviour, other tasks' sections.
-7. **Git:** don't commit or push unless the user asks. The working tree may contain the user's uncommitted work — never `git checkout`, `git restore`, `git reset` or `git stash` files. Run `git status` and `git diff --stat` **before you start** and keep the output: the "only these files changed" checks below mean *changed by you in this session*, compared with that starting point.
+7. **Git:** don't commit or push unless the user asks. The working tree may contain the user's uncommitted work — never `git checkout`, `git restore`, `git reset` or `git stash` files. Run `git status` and `git diff --stat` **before you start** and keep the output: the "only these files changed" checks below mean _changed by you in this session_, compared with that starting point.
 8. **If the spec looks wrong, contradicts the code, or can't be built as written, stop and ask the user** — describe the conflict precisely. Don't improvise a different design. Decisions marked as agreed with the user are not open for change.
-9. **Final check — required before saying the task is done.** Run the full build (all environments, zero errors, no new warnings). Then re-read the task section from the top and go through its *Final verification* list one item at a time: open the code, confirm the item, and write a table `ID | done? | file:line | note`. Fix anything missing. Report to the user: the files changed, that table, every deviation from the spec and why, questions for the user, and which boards need reflashing.
+9. **Final check — required before saying the task is done.** Run the full build (all environments, zero errors, no new warnings). Then re-read the task section from the top and go through its _Final verification_ list one item at a time: open the code, confirm the item, and write a table `ID | done? | file:line | note`. Fix anything missing. Report to the user: the files changed, that table, every deviation from the spec and why, questions for the user, and which boards need reflashing.
 10. **Documentation is part of the task:** update the sections the task names and the [Contents](#contents) list. When the task is done, mark it **DONE** in the task table and add your report (files changed, the final-verification table, deviations, reflash list) under a `## Current grunt work report` section after Current tasks (create it if it isn't there). **Don't move tasks to Completed and don't delete task sections** — the larger model does that after it has reviewed the work.
 
 ## Future tasks
 
 - **Hardware verification before field use.** Nothing has run on the machine yet.
-  - Dispenser module on the bench: **covered by the bench test image** (`src/dispenser_bench`) — supply, driver, motor, both encoder channels, the direction line, the radio, and every input the other two boards can send. See [docs/dispenser_module_hardware.md](docs/dispenser_module_hardware.md) §6.
+  - Dispenser module on the bench: **the bench test image ran on 17 September 2026** ([docs/dispenser_module_hardware.md](docs/dispenser_module_hardware.md) §6). Supply, driver, motor, both encoder channels, direction, radio, metering, link loss and the calibration run passed. **Not run yet:** the K tests (clog and unclogging with the motor; only K07 needs the lever) and the stall tests H06 and K07 (no fuse on the bench). That run's four failures were bugs in the tests, fixed afterwards: D08 and D20 expected the calibration target on the step that enters Calibrating, which resets the controller; C04 counted the shaft coasting down from metering; and `benchPrepare()` started the logic before its 1 s wait, so the first control step of every motor test integrated a whole second of error — M02 measured 215 RPM for a 192 RPM target (a simulation of the controller reproduces 214).
   - All three boards on a desk: pull power from each in turn — the seeder holds its relay, the dispenser stops when the seeder goes, the right `BRAK:` letters appear. With a fault beeping, cut the seeder's power: the buzzer must stop (regression check for the old stuck-buzzer bug).
   - `WHEEL_MM_PER_PULSE`: push the seeder along a measured 100 m and count `wheelPulses`; the value is 100000 / pulses. Use 100 m, not 20 m: 20 m is only ~32 pulses, so one pulse either way is a 3 % error. Repeat at two seed-rate settings to confirm the sensor really is before the gearbox.
   - Dispenser calibration: check `ENCODER_EDGES_PER_REV` by hand-turning 10 revolutions (≈ 4800 edges), then `Kalibracja` → `TEST`, catch and weigh the output, enter it.
@@ -314,7 +322,9 @@ The rules below apply to every new task written into this section.
 - **README is out of date** — it still says to write MAC addresses into the source and describes two boards.
 - **Real WOM (power take-off) RPM sensing** — hardcoded to `540` in `src/seeder/main.cpp` (`telemetry.womRPM = 540`). The WOM alarms in `updateFaults()` stay dead code (`ENABLE_WOM_ALARM` is `false`) until a real sensor exists.
 - **Wiring diagram** and **demonstration video** — README TODOs.
-- **After the bench test:** copy the measured `ENCODER_EDGES_PER_REV`, `MOTOR_MIN_RUNNING_PERMILLE`, `MOTOR_MAX_RPM` and, if needed, `MOTOR_DIR_FORWARD` into `include/machine_settings.h` (the bench summary prints them), rebuild, reflash the dispenser.
+- **Motor constants from the machine — the one tweak that matters for dose accuracy.** The bench run confirmed `ENCODER_EDGES_PER_REV` = 480 (481 by hand; the calibration run stopped at 100.2 revolutions) and `MOTOR_DIR_FORWARD` = `LOW`. It measured only a free shaft on the bench supply: 347 RPM at full duty against `MOTOR_MAX_RPM` = 330, breakaway at 70 permille against `MOTOR_MIN_RUNNING_PERMILLE` = 80.
+  - Why `MOTOR_MAX_RPM` matters: the feed-forward assumes the motor reaches it at full duty, and the integral resets whenever metering stops (headland, lifting), so every start runs on the feed-forward alone. Simulated with a motor 15 % faster than assumed (a tractor at ~14 V), a 192 RPM target runs at ~221 RPM for the first 2 s, 210 after 4 s, 197 after 16 s; with `MOTOR_MAX_RPM` equal to the real speed, 193 from the start. It is also the `ZA SZYBKO` limit, so it must be a speed the **loaded** motor really reaches.
+  - How: flash the bench image on the fitted module and run `h` with the auger coupled, fertilizer in the hopper, a bucket under the outlet and the engine running (skip H02 and H06). Set `MOTOR_MAX_RPM` to H03's full-duty RPM and `MOTOR_MIN_RUNNING_PERMILLE` a margin above H05's breakaway, rebuild, reflash the production firmware.
 - **Host-side unit tests (optional)** — `src/seeder/wheel_speed.h` and `src/dispenser/dispenser_logic.h` have no hardware code, so they could run under `pio test -e native`. That needs a host C++ compiler such as MinGW-w64, which this PC doesn't have. The bench image's D tests already cover the dispenser logic on the ESP32.
 
 ## Completed
@@ -342,20 +352,20 @@ Condensed from the Implementation_Plan that produced the firmware above (its pha
 
 #### Review findings that were fixed (Implementation_Plan §1)
 
-| | Problem in the original two-board firmware | Fix |
-|---|---|---|
-| F1 | Display, buzzer and LEDs driven from the ESP-NOW receive callback: stalled packet reception, raced `loop()` on the I2C bus, and the buzzer could stay on when packets stopped mid-beep | callback only validates, copies and timestamps; all output work in `loop()`, serviced every iteration |
-| F2 | `memcpy` without checking length or type | `headerValid()`: magic, version, network id, type, exact length |
-| F3 | no fail-safe on link loss | fail-safe rules below |
-| F4 | pulse counters read then reset, losing pulses in between | ISR counters only increment; readers subtract snapshots |
-| F5 | Arduino `String` for state (heap churn all day) | `enum class` |
-| F6 | faults computed after drawing, so one packet late | fixed by ordering in `loop()` |
-| F7 | RPM maths divided before multiplying | multiply first, divide by measured elapsed time, pulses-per-rev constant |
-| F8 | cast on the receive callback hid signature changes | cast removed, the compiler checks it |
-| F9 | shadowed global variable | removed |
-| F10 | tramline rhythm and active passes hardcoded | named constants |
-| F11 | WiFi channel not pinned, power save on | fixed channel, power save off, identical on every board |
-| F12 | (not a bug) sending every 200 ms even when nothing changes | kept on purpose: the periodic packet is the heartbeat that makes silence mean "board gone" |
+|     | Problem in the original two-board firmware                                                                                                                                             | Fix                                                                                                   |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| F1  | Display, buzzer and LEDs driven from the ESP-NOW receive callback: stalled packet reception, raced `loop()` on the I2C bus, and the buzzer could stay on when packets stopped mid-beep | callback only validates, copies and timestamps; all output work in `loop()`, serviced every iteration |
+| F2  | `memcpy` without checking length or type                                                                                                                                               | `headerValid()`: magic, version, network id, type, exact length                                       |
+| F3  | no fail-safe on link loss                                                                                                                                                              | fail-safe rules below                                                                                 |
+| F4  | pulse counters read then reset, losing pulses in between                                                                                                                               | ISR counters only increment; readers subtract snapshots                                               |
+| F5  | Arduino `String` for state (heap churn all day)                                                                                                                                        | `enum class`                                                                                          |
+| F6  | faults computed after drawing, so one packet late                                                                                                                                      | fixed by ordering in `loop()`                                                                         |
+| F7  | RPM maths divided before multiplying                                                                                                                                                   | multiply first, divide by measured elapsed time, pulses-per-rev constant                              |
+| F8  | cast on the receive callback hid signature changes                                                                                                                                     | cast removed, the compiler checks it                                                                  |
+| F9  | shadowed global variable                                                                                                                                                               | removed                                                                                               |
+| F10 | tramline rhythm and active passes hardcoded                                                                                                                                            | named constants                                                                                       |
+| F11 | WiFi channel not pinned, power save on                                                                                                                                                 | fixed channel, power save off, identical on every board                                               |
+| F12 | (not a bug) sending every 200 ms even when nothing changes                                                                                                                             | kept on purpose: the periodic packet is the heartbeat that makes silence mean "board gone"            |
 
 #### Addressing and link status (§2)
 
@@ -375,22 +385,22 @@ Condensed from the Implementation_Plan that produced the firmware above (its pha
 
 Governing principle, agreed with the user: **a gap in the field is a permanent defect**, so an actuator holds its last command on link loss unless holding would be meaningless or unsafe.
 
-| Board | Condition | Behaviour |
-|---|---|---|
-| Seeder | boot, before any command | relay off |
-| Seeder | tractor not heard, for any time | holds the last relay state — dropping it mid-pass would leave an unmarked gap in the tramline |
-| Dispenser | boot | PWM 0 before anything else in `setup()`; the pull-down resistors cover reset and boot before that |
-| Dispenser | seeder not heard for `LINK_TIMEOUT_MS` | motor off, fault `NoSpeedData` — without ground speed any rate is a guess |
-| Dispenser | tractor not heard | keeps metering with the last dose and calibration (an unfertilised strip is a permanent defect); the speed interlock still applies |
-| Dispenser | wheel not turning, speed 0, dispenser off or dose 0 | motor off — covers headland turns, lifting and standing still |
-| Dispenser | calibration run and the tractor is lost | run aborts, motor off — the tractor commanded it |
-| Dispenser | calibration run and the seeder reports the wheel turning | refused or stopped, motor off |
-| Dispenser | clog detected | motor off until the operator decides — neither metering nor a calibration run restarts by itself |
-| Dispenser | tractor lost while unclogging | back to `Clogged`, motor off — losing the tractor is not an operator decision |
-| Dispenser | a calibration request still raised after a dispenser reboot, link gap, clog or cancel | no run until the tractor lowers and raises it again (the "armed" rule) |
-| Tractor | dispenser reports `Clogged` | `ZATKANIE!` alarm over any screen, buzzer included |
-| Tractor | a peer not heard for `LINK_TIMEOUT_MS` | blue LED blinks, `BRAK:` letters on the work screen, no buzzer yet |
-| Tractor | a peer that had been heard stays silent `LINK_BUZZER_DELAY_MS` longer, or seeder and dispenser can't hear each other | buzzer — timed from the loss of contact, so powering the tractor up first stays silent |
+| Board     | Condition                                                                                                            | Behaviour                                                                                                                          |
+| --------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Seeder    | boot, before any command                                                                                             | relay off                                                                                                                          |
+| Seeder    | tractor not heard, for any time                                                                                      | holds the last relay state — dropping it mid-pass would leave an unmarked gap in the tramline                                      |
+| Dispenser | boot                                                                                                                 | PWM 0 before anything else in `setup()`; the pull-down resistors cover reset and boot before that                                  |
+| Dispenser | seeder not heard for `LINK_TIMEOUT_MS`                                                                               | motor off, fault `NoSpeedData` — without ground speed any rate is a guess                                                          |
+| Dispenser | tractor not heard                                                                                                    | keeps metering with the last dose and calibration (an unfertilised strip is a permanent defect); the speed interlock still applies |
+| Dispenser | wheel not turning, speed 0, dispenser off or dose 0                                                                  | motor off — covers headland turns, lifting and standing still                                                                      |
+| Dispenser | calibration run and the tractor is lost                                                                              | run aborts, motor off — the tractor commanded it                                                                                   |
+| Dispenser | calibration run and the seeder reports the wheel turning                                                             | refused or stopped, motor off                                                                                                      |
+| Dispenser | clog detected                                                                                                        | motor off until the operator decides — neither metering nor a calibration run restarts by itself                                   |
+| Dispenser | tractor lost while unclogging                                                                                        | back to `Clogged`, motor off — losing the tractor is not an operator decision                                                      |
+| Dispenser | a calibration request still raised after a dispenser reboot, link gap, clog or cancel                                | no run until the tractor lowers and raises it again (the "armed" rule)                                                             |
+| Tractor   | dispenser reports `Clogged`                                                                                          | `ZATKANIE!` alarm over any screen, buzzer included                                                                                 |
+| Tractor   | a peer not heard for `LINK_TIMEOUT_MS`                                                                               | blue LED blinks, `BRAK:` letters on the work screen, no buzzer yet                                                                 |
+| Tractor   | a peer that had been heard stays silent `LINK_BUZZER_DELAY_MS` longer, or seeder and dispenser can't hear each other | buzzer — timed from the loss of contact, so powering the tractor up first stays silent                                             |
 
 #### Tractor UI (§6)
 

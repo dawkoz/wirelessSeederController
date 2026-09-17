@@ -515,7 +515,9 @@ static void testD08()
     for (int i = 0; i < 10; i++) {
         dStep(h);
         if (h.logic.mode != DispenserMode::Calibrating) ok = false;
-        if (h.logic.targetRPM != CALIBRATION_RPM) ok = false;
+        // The step that enters Calibrating resets the controller (target 0,
+        // motor off); the run drives from the next step.
+        if (i > 0 && h.logic.targetRPM != CALIBRATION_RPM) ok = false;
     }
 
     h.shaftRPM = 0;
@@ -1001,8 +1003,10 @@ static void testD20()
         dStep(h);
 
         if (h.logic.mode == DispenserMode::Calibrating) {
-            if (!started) started = true;
-            if (h.logic.targetRPM != CALIBRATION_RPM) ok = false;
+            // The step that enters Calibrating resets the controller (target 0,
+            // motor off); the run drives from the next step.
+            if (started && h.logic.targetRPM != CALIBRATION_RPM) ok = false;
+            started = true;
             if (!h.out.motorForward) ok = false;
             if (h.logic.progress < lastProgress) ok = false;
             lastProgress = h.logic.progress;
