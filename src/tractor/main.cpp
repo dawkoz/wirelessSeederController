@@ -41,6 +41,10 @@ enum class Screen : uint8_t {
     CalibConfirm,     // "Start kalibracji?" -> Anuluj / START
     CalibRunning,     // progress bar while the dispenser turns
     Tramlines,        // the tramline on/off switch, screen 15
+    Seeds,            // seed size and its wheel calibration, screen 16
+    SeedCalibAsk,     // "Kalibracja kola?" -> Anuluj / OK, screen 17
+    SeedCalibRun,     // driving the measured distance, screen 18
+    SeedCalibResult,  // the measured value, or why there isn't one, screen 19
 };
 
 // What is actually on the display. One Screen can show as several Views
@@ -64,6 +68,10 @@ enum class View : uint8_t {
     ClogAlert,
     ClogChoice,
     Unclogging,
+    Seeds,
+    SeedCalibAsk,
+    SeedCalibRun,
+    SeedCalibResult,
 };
 
 enum class MenuItem : uint8_t {
@@ -71,8 +79,14 @@ enum class MenuItem : uint8_t {
     Dawka      = 1,
     Kalibracja = 2,
     Sciezki    = 3,
-    Count      = 4,
+    Nasiona    = 4,
+    Count      = 5,
 };
+
+// More items than rows, so the menu scrolls: four are drawn from menuTop, which
+// follows the cursor.
+static const char *const MENU_LABELS[] = {"Praca", "Dawka", "Kalibracja", "Sciezki", "Nasiona"};
+static constexpr uint8_t MENU_VISIBLE_ROWS = 4;
 
 enum class FaultCode : uint8_t {
     None,
@@ -87,6 +101,7 @@ enum class ButtonEvent : uint8_t { None, Short, Long };
 
 static Screen   screen   = Screen::Menu;
 static uint8_t  menuIndex = 0;
+static uint8_t  menuTop   = 0;   // first of the four menu rows on screen
 
 // Numeric editor. digits[] holds one decimal digit each, most significant
 // first. The cursor runs across the digits and then onto two trailing action
@@ -115,6 +130,34 @@ static uint8_t tramlineNumber = 0;
 // not lose the pass. Stored in NVS, written only when it is flipped.
 static bool    tramlinesEnabled = false;
 static uint8_t tramlineCursor   = 0;      // screen 15: 0 = the switch, 1 = ZAPISZ
+
+// Distance covered between two wheel pulses, one value per seed-size gear: the
+// pin-27 sensor is on the metering drive, so it turns at a different rate to
+// the ground wheel and the ratio depends on the gear. Both values are measured
+// by driving WHEEL_CALIB_DISTANCE_M (screens 16-19) and kept in NVS; the active
+// one goes out in every command, and the seeder and dispenser meter with it.
+static uint16_t wheelMmSmall = WHEEL_MM_PER_PULSE_DEFAULT;
+static uint16_t wheelMmLarge = WHEEL_MM_PER_PULSE_DEFAULT;
+static bool     seedLarge    = false;     // false = small seeds
+
+static uint8_t  seedCursor      = 0;      // screen 16: 0 Male, 1 Duze, 2 Kalibracja, 3 Wroc
+static uint8_t  seedAskIndex    = 0;      // screen 17: 0 = Anuluj, 1 = OK
+static uint8_t  seedResultIndex = 0;      // screen 19: 0 = Anuluj, 1 = ZAPISZ
+
+// Why a calibration run produced no usable number. The result screen shows the
+// reason and offers nothing but Anuluj.
+enum class WheelCalibError : uint8_t { None, NoSeeder, SeederReset, TooFew, OutOfRange };
+
+static uint32_t calibWheelStartPulses = 0;
+static uint32_t calibWheelStartUpTime = 0;   // the seeder's, to catch its counter restarting
+static uint32_t calibWheelPulses      = 0;   // pulses over the finished run
+static uint16_t calibWheelResultMm    = 0;
+static WheelCalibError calibWheelError = WheelCalibError::None;
+
+static uint16_t activeWheelMmPerPulse()
+{
+    return seedLarge ? wheelMmLarge : wheelMmSmall;
+}
 
 static Preferences prefs;
 static LinkTracker links;
@@ -252,6 +295,7 @@ static void sendCommand(uint32_t now)
     command.upTimeMs         = now;
     command.clogClearSeq     = clogClearSeq;
     command.unclogSeq        = unclogSeq;
+    command.wheelMmPerPulse  = activeWheelMmPerPulse();
 
     broadcast(&command, sizeof(command), now);
 }
@@ -357,6 +401,10 @@ static void handleMenu(ButtonEvent event)
 {
     if (event == ButtonEvent::Short) {
         menuIndex = (menuIndex + 1) % (uint8_t)MenuItem::Count;
+        // Keep the cursor on screen. Wrapping back to the first item pulls the
+        // window back to the top by itself.
+        if (menuIndex < menuTop)                          menuTop = menuIndex;
+        if (menuIndex > menuTop + (MENU_VISIBLE_ROWS - 1)) menuTop = menuIndex - (MENU_VISIBLE_ROWS - 1);
     } else if (event == ButtonEvent::Long) {
         switch ((MenuItem)menuIndex) {
             case MenuItem::Praca:
@@ -373,6 +421,10 @@ static void handleMenu(ButtonEvent event)
             case MenuItem::Sciezki:
                 screen = Screen::Tramlines;
                 tramlineCursor = 0;   // cursor starts on the switch
+                break;
+            case MenuItem::Nasiona:
+                screen = Screen::Seeds;
+                seedCursor = 0;       // cursor starts on the first size, never on Wroc
                 break;
             default:
                 break;
@@ -405,6 +457,125 @@ static void handleTramlines(ButtonEvent event)
         } else {
             screen = Screen::Menu;
         }
+    }
+}
+
+// Screen 16: the seed-size gear and its wheel calibration. Picking a size
+// stores it at once, like the tramline switch - there is nothing pending to
+// save, so the way out is the Wroc row rather than a ZAPISZ field.
+static void handleSeeds(ButtonEvent event)
+{
+    if (event == ButtonEvent::Short) {
+        seedCursor = (seedCursor + 1) % 4;
+        return;
+    }
+    if (event != ButtonEvent::Long) return;
+
+    switch (seedCursor) {
+        case 0:
+        case 1: {
+            bool large = (seedCursor == 1);
+            if (large != seedLarge) {
+                seedLarge = large;
+                prefs.putBool("seed_l", seedLarge);
+            }
+            break;
+        }
+        case 2:
+            seedAskIndex = 0;                  // Anuluj preselected
+            screen = Screen::SeedCalibAsk;
+            break;
+        default:
+            screen = Screen::Menu;
+            break;
+    }
+}
+
+// Start of a wheel calibration run: remember where the seeder's cumulative
+// pulse counter stood, and its uptime, so a reboot of the seeder mid-run can be
+// told from a simple link gap. A gap loses nothing - the counter is cumulative.
+static void startWheelCalibration()
+{
+    calibWheelError  = WheelCalibError::None;
+    seedResultIndex  = 0;
+
+    if (!seederEverSeen || !links.isAlive(NodeId::Seeder)) {
+        calibWheelError = WheelCalibError::NoSeeder;
+        screen = Screen::SeedCalibResult;
+        return;
+    }
+
+    calibWheelStartPulses = seederData.wheelPulses;
+    calibWheelStartUpTime = seederData.upTimeMs;
+    calibWheelPulses      = 0;
+    screen = Screen::SeedCalibRun;
+}
+
+static void finishWheelCalibration()
+{
+    calibWheelError = WheelCalibError::None;
+    seedResultIndex = 0;
+
+    if (!links.isAlive(NodeId::Seeder)) {
+        calibWheelError = WheelCalibError::NoSeeder;
+    } else if (seederData.upTimeMs < calibWheelStartUpTime) {
+        // Its counter restarted, so the difference means nothing.
+        calibWheelError = WheelCalibError::SeederReset;
+    } else {
+        calibWheelPulses = seederData.wheelPulses - calibWheelStartPulses;
+        if (calibWheelPulses < WHEEL_CALIB_MIN_PULSES) {
+            calibWheelError = WheelCalibError::TooFew;
+        } else {
+            // Rounded, not truncated: one millimetre matters over 100 m.
+            uint32_t mm = ((uint32_t)WHEEL_CALIB_DISTANCE_M * 1000UL + calibWheelPulses / 2) / calibWheelPulses;
+            if (mm < WHEEL_MM_PER_PULSE_MIN || mm > WHEEL_MM_PER_PULSE_MAX) {
+                calibWheelError = WheelCalibError::OutOfRange;
+            } else {
+                calibWheelResultMm = (uint16_t)mm;
+            }
+        }
+    }
+    screen = Screen::SeedCalibResult;
+}
+
+static void handleSeedCalibAsk(ButtonEvent event)
+{
+    if (event == ButtonEvent::Short) {
+        seedAskIndex = (seedAskIndex + 1) % 2;
+    } else if (event == ButtonEvent::Long) {
+        if (seedAskIndex == 1) startWheelCalibration();
+        else                   screen = Screen::Seeds;
+    }
+}
+
+// Screen 18: only a long press ends the run. A stray short press must not throw
+// away a 100 m drive - the same reasoning as the dispenser's calibration run.
+static void handleSeedCalibRun(ButtonEvent event)
+{
+    if (event == ButtonEvent::Long) finishWheelCalibration();
+}
+
+static void handleSeedCalibResult(ButtonEvent event)
+{
+    if (calibWheelError != WheelCalibError::None) {
+        if (event != ButtonEvent::None) screen = Screen::Seeds;
+        return;
+    }
+
+    if (event == ButtonEvent::Short) {
+        seedResultIndex = (seedResultIndex + 1) % 2;
+    } else if (event == ButtonEvent::Long) {
+        if (seedResultIndex == 1) {
+            // Into the slot for the size being calibrated, never the other one.
+            if (seedLarge) {
+                wheelMmLarge = calibWheelResultMm;
+                prefs.putUShort("wheel_l", wheelMmLarge);
+            } else {
+                wheelMmSmall = calibWheelResultMm;
+                prefs.putUShort("wheel_s", wheelMmSmall);
+            }
+        }
+        screen = Screen::Seeds;
     }
 }
 
@@ -529,6 +700,10 @@ static void handleView(View view, ButtonEvent event)
         case View::EditDose:
         case View::EditCalibration:   handleEdit(event);          break;
         case View::Tramlines:         handleTramlines(event);     break;
+        case View::Seeds:             handleSeeds(event);         break;
+        case View::SeedCalibAsk:      handleSeedCalibAsk(event);  break;
+        case View::SeedCalibRun:      handleSeedCalibRun(event);  break;
+        case View::SeedCalibResult:   handleSeedCalibResult(event); break;
         case View::CalibConfirm:      handleCalibConfirm(event);  break;
         case View::CalibProgress:
         case View::CalibNoDispenser:  handleCalibTurning(event);  break;
@@ -677,6 +852,10 @@ static View currentView()
         case Screen::EditDose:        return View::EditDose;
         case Screen::EditCalibration: return View::EditCalibration;
         case Screen::Tramlines:       return View::Tramlines;
+        case Screen::Seeds:           return View::Seeds;
+        case Screen::SeedCalibAsk:    return View::SeedCalibAsk;
+        case Screen::SeedCalibRun:    return View::SeedCalibRun;
+        case Screen::SeedCalibResult: return View::SeedCalibResult;
         case Screen::CalibConfirm:    return View::CalibConfirm;
         case Screen::CalibRunning:
             if (calibrationInterrupted)            return View::CalibInterrupted;
@@ -746,10 +925,115 @@ static void drawMenuRow(int16_t rowTop, const char *text, bool selected)
 
 static void drawMenu()
 {
-    drawMenuRow(0,  "Praca",      menuIndex == 0);
-    drawMenuRow(16, "Dawka",      menuIndex == 1);
-    drawMenuRow(32, "Kalibracja", menuIndex == 2);
-    drawMenuRow(48, "Sciezki",    menuIndex == 3);
+    for (uint8_t row = 0; row < MENU_VISIBLE_ROWS; row++) {
+        uint8_t item = menuTop + row;
+        if (item >= (uint8_t)MenuItem::Count) break;
+        drawMenuRow(row * 16, MENU_LABELS[item], menuIndex == item);
+    }
+}
+
+// Screen 16. Two different things have to be visible at once: the cursor (the
+// inverted row, as everywhere else) and which setting is actually in use (the
+// square on the right). One button cannot show both by highlighting alone.
+// "Kalibracja" is 10 characters, exactly the full width at text size 2, which
+// is why the marker sits on the right instead of in front of the text.
+static void drawSeedRow(int16_t rowTop, const char *text, bool selected, bool active)
+{
+    drawMenuRow(rowTop, text, selected);
+    if (active) oled.fillRect(118, rowTop + 5, 6, 6, selected ? BLACK : WHITE);
+}
+
+static void drawSeeds()
+{
+    drawSeedRow(0,  "Male nas.",  seedCursor == 0, !seedLarge);
+    drawSeedRow(16, "Duze nas.",  seedCursor == 1, seedLarge);
+    drawSeedRow(32, "Kalibracja", seedCursor == 2, false);
+    drawSeedRow(48, "Wroc",       seedCursor == 3, false);
+}
+
+// Screen 17, on the 20 px grid the other confirm screens use.
+static void drawSeedCalibAsk()
+{
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(0, 4);
+    oled.print("Kalibracja kola");
+    oled.setCursor(0, 16);
+    oled.print(seedLarge ? "duze nasiona" : "male nasiona");
+
+    oled.setTextSize(2);
+    drawSelectableLine(26, "Anuluj", seedAskIndex == 0);
+    drawSelectableLine(46, "OK",     seedAskIndex == 1);
+}
+
+// Screen 18: the pulse count, in the biggest digits that fit. How far that is
+// in metres is deliberately not shown - it could only be worked out with the
+// value being replaced, which on a first calibration is exactly the number that
+// is wrong. The distance is the one thing the operator measures on the ground.
+static void drawSeedCalibRun()
+{
+    uint32_t pulses = (seederData.wheelPulses >= calibWheelStartPulses)
+                      ? (seederData.wheelPulses - calibWheelStartPulses) : 0;
+
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(0, 0);
+    oled.print("Przejedz ");
+    oled.print(WHEEL_CALIB_DISTANCE_M);
+    oled.print(" m");
+
+    oled.setTextSize(2);
+    oled.setCursor(4, 14);
+    oled.print("Impulsy:");
+
+    oled.setTextSize(3);
+    oled.setCursor(4, 32);
+    oled.print(pulses);
+
+    oled.setTextSize(1);
+    oled.setCursor(0, 56);
+    oled.print("Dlugi klik = koniec");
+}
+
+// Screen 19: the measured value against the one it would replace, or why there
+// is no value. A failed run offers nothing but Anuluj - it must never look like
+// something worth saving.
+static void drawSeedCalibResult()
+{
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+
+    if (calibWheelError != WheelCalibError::None) {
+        oled.setCursor(0, 0);
+        oled.print("Kalibracja kola");
+        oled.setCursor(0, 12);
+        switch (calibWheelError) {
+            case WheelCalibError::NoSeeder:    oled.print("Brak siewnika");       break;
+            case WheelCalibError::SeederReset: oled.print("Reset siewnika");      break;
+            case WheelCalibError::TooFew:      oled.print("Za malo impulsow");    break;
+            default:                           oled.print("Wynik poza zakresem"); break;
+        }
+        oled.setTextSize(2);
+        drawSelectableLine(36, "Anuluj", true);
+        return;
+    }
+
+    oled.setCursor(0, 0);
+    oled.print("Wynik: ");
+    oled.print(calibWheelPulses);
+    oled.print(" imp");
+    oled.setCursor(0, 8);
+    oled.print("1 imp = ");
+    oled.print(calibWheelResultMm);
+    oled.print(" mm");
+    oled.setCursor(0, 16);
+    oled.print("bylo ");
+    oled.print(activeWheelMmPerPulse());
+    oled.print(" mm");
+
+    oled.setTextSize(2);
+    drawSelectableLine(26, "Anuluj", seedResultIndex == 0);
+    drawSelectableLine(46, "ZAPISZ", seedResultIndex == 1);
 }
 
 static void drawFaultScreen()
@@ -808,6 +1092,12 @@ static void drawWork()
     oled.print('.');
     oled.print(kmhTenths % 10);
     oled.print("km/h");
+
+    // Which seed-size gear the dose is being metered for. One letter, because
+    // the line is full at two digits of speed - but it has to be somewhere: the
+    // wrong setting silently changes the rate by about a fifth.
+    oled.setCursor(54, 20);
+    oled.print(seedLarge ? 'D' : 'M');
 
     oled.setCursor(66, 20);
     if (!dispenserEnabled || doseKgPerHa == 0) {
@@ -1083,6 +1373,10 @@ static void redraw()
         case View::EditDose:
         case View::EditCalibration:   drawEdit();             break;
         case View::Tramlines:         drawTramlines();        break;
+        case View::Seeds:             drawSeeds();            break;
+        case View::SeedCalibAsk:      drawSeedCalibAsk();     break;
+        case View::SeedCalibRun:      drawSeedCalibRun();     break;
+        case View::SeedCalibResult:   drawSeedCalibResult();  break;
         case View::CalibConfirm:      drawCalibConfirm();     break;
         case View::CalibProgress:     drawCalibProgress();    break;
         case View::CalibDone:         drawCalibDone();        break;
@@ -1116,6 +1410,9 @@ void setup()
     gramsPer100Rev   = prefs.getULong("calib",  DEFAULT_GRAMS_PER_100REV);
     dispenserEnabled = prefs.getBool("disp_on", false);
     tramlinesEnabled = prefs.getBool("tram_on", false);   // no saved value = off
+    wheelMmSmall     = prefs.getUShort("wheel_s", WHEEL_MM_PER_PULSE_DEFAULT);
+    wheelMmLarge     = prefs.getUShort("wheel_l", WHEEL_MM_PER_PULSE_DEFAULT);
+    seedLarge        = prefs.getBool("seed_l", false);    // no saved value = small seeds
 
     oled.begin(SH1106_SWITCHCAPVCC, OLED_I2C_ADDRESS);
     // oled.begin() calls Wire.begin(), which leaves the bus at the Arduino
@@ -1216,7 +1513,8 @@ void loop()
     //    identical image.
     View liveView = currentView();
     bool live = (liveView == View::Work || liveView == View::WorkFault ||
-                 liveView == View::CalibProgress || liveView == View::Unclogging);
+                 liveView == View::CalibProgress || liveView == View::Unclogging ||
+                 liveView == View::SeedCalibRun);
 
     if (displayDirty || (live && (now - lastDisplayMs >= DISPLAY_INTERVAL_MS))) {
         lastDisplayMs = now;

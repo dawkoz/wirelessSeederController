@@ -56,6 +56,15 @@ struct DispenserLogic {
     bool     clogTimerRunning = false;
     uint32_t clogTimerStartMs = 0;
 
+    // Distance ledger (see ledgerCatchupRPM). owedRevolutions is the debt in
+    // output-shaft revolutions; the two snapshots are what it is measured
+    // against, and ledgerValid is false until a metering step has taken them.
+    float    owedRevolutions    = 0.0f;
+    uint32_t ledgerPulses       = 0;
+    uint32_t ledgerEdges        = 0;
+    uint32_t ledgerSincePulseMs = 0;
+    bool     ledgerValid        = false;
+
     // Calibration run bookkeeping. calibrationArmed is what stops a run from
     // starting by itself after a reboot, a link gap, a clog or a cancel: it
     // is only set by a received command with calibrationRun == 0, and cleared
@@ -86,6 +95,11 @@ inline void resetController(DispenserLogic &logic)
     logic.targetRPM        = 0;
     logic.clogTimerRunning = false;
     logic.clogTimerStartMs = 0;
+    // The ledger dies with the controller. A debt must never survive a stop, a
+    // clog or a mode change and then be paid off in one spot - the fertilizer
+    // it stands for belongs to ground the machine has already left.
+    logic.owedRevolutions  = 0.0f;
+    logic.ledgerValid      = false;
 }
 
 inline void dispenserInit(DispenserLogic &logic, uint32_t nowMs, uint32_t edges)
@@ -103,6 +117,9 @@ inline void dispenserInit(DispenserLogic &logic, uint32_t nowMs, uint32_t edges)
     logic.lastCommandUpTimeMs = 0;
     logic.tractorWasAlive   = false;
     logic.unclogStartMs     = 0;
+    logic.ledgerPulses      = 0;
+    logic.ledgerEdges       = 0;
+    logic.ledgerSincePulseMs = 0;
     logic.prevOutput.motorPermille = 0;
     logic.prevOutput.motorForward  = true;
     resetController(logic);
@@ -132,6 +149,17 @@ inline uint32_t requiredShaftRPM(uint16_t speedMmS, uint16_t doseKgPerHa, uint32
     uint64_t denominator = (uint64_t)gramsPer100Rev * 10000ULL;
 
     return (uint32_t)(numerator / denominator);
+}
+
+// Revolutions of the output shaft per metre travelled - the same maths as
+// requiredShaftRPM() one step earlier, and the two have to agree:
+// revolutionsPerMetre * speed [m/s] * 60 == requiredShaftRPM(). At 4 m and
+// 40 kg/ha with 500 g per 100 rev that is 3.2 rev/m, and 3.2 * 60 * 1 m/s is
+// the same 192 RPM.
+inline float revolutionsPerMetre(uint16_t doseKgPerHa, uint32_t gramsPer100Rev)
+{
+    if (doseKgPerHa == 0 || gramsPer100Rev == 0) return 0.0f;
+    return (float)WORKING_WIDTH_CM * (float)doseKgPerHa / (10.0f * (float)gramsPer100Rev);
 }
 
 // Feed-forward plus a PI trim, shared by normal metering and the calibration
@@ -168,6 +196,85 @@ inline uint16_t computeDuty(DispenserLogic &logic, uint16_t target, uint32_t ela
     uint16_t permille = (uint16_t)output;
     if (permille > 0 && permille < MOTOR_MIN_RUNNING_PERMILLE) permille = MOTOR_MIN_RUNNING_PERMILLE;
     return permille;
+}
+
+// The distance ledger: metering follows the ground rather than the speed
+// estimate. Every wheel pulse is a fixed distance, a fixed distance is a fixed
+// number of shaft turns, and the encoder says how many turns were really made.
+// The difference is a debt in revolutions, and this returns the RPM to add to
+// the rate so that it is paid off over LEDGER_CATCHUP_SECONDS.
+//
+// Why it is worth the state: one wheel pulse is about 0.8 m and the seeder
+// averages its speed over a whole metering turn (~4.7 m), so the rate is right
+// only on average and lags every change in speed - and the motor needs a few
+// seconds to settle after each start. The ledger turns what that costs from
+// fertilizer never applied into fertilizer applied a few metres later.
+//
+// Three cases add no debt and only take fresh snapshots:
+//   - the first metering step, which has nothing to compare against;
+//   - the seeder's cumulative counter going backwards, i.e. it rebooted (it
+//     cannot wrap: about 1.3 pulses per metre against 2^32);
+//   - over-speed, because a debt earned while the motor is already at its limit
+//     cannot be repaid without double-dosing the strip that follows. ZA SZYBKO
+//     is what the operator acts on there, not the ledger.
+//
+// Starting to count again credits the next whole pulse, part of which is ground
+// covered before the ledger was looking: up to one pulse of debt that is not
+// owed - about 12 g of fertilizer at the usual settings, always in the
+// direction of applying slightly more. Small enough to leave alone; correcting
+// it needs another piece of state and trades the bias for an under-application
+// at the start of every pass instead.
+inline float ledgerCatchupRPM(DispenserLogic &logic, const DispenserInputs &in,
+                              uint32_t elapsed, float revsPerMetre, bool overSpeed)
+{
+    uint16_t mmPerPulse = validWheelMmPerPulse(in.command.wheelMmPerPulse);
+    uint32_t pulses     = in.telemetry.wheelPulses;
+    uint32_t edges      = in.encoderEdges;
+
+    if (!logic.ledgerValid || pulses < logic.ledgerPulses || overSpeed) {
+        logic.ledgerPulses       = pulses;
+        logic.ledgerEdges        = edges;
+        logic.ledgerSincePulseMs = 0;
+        logic.ledgerValid        = true;
+        return 0.0f;
+    }
+
+    uint32_t deltaPulses = pulses - logic.ledgerPulses;
+    uint32_t deltaEdges  = edges  - logic.ledgerEdges;
+    logic.ledgerPulses = pulses;
+    logic.ledgerEdges  = edges;
+
+    logic.owedRevolutions += ((float)deltaPulses * (float)mmPerPulse / 1000.0f) * revsPerMetre;
+    logic.owedRevolutions -= (float)deltaEdges / (float)ENCODER_EDGES_PER_REV;
+
+    // Cap the debt at a fixed distance of fertilizer: a spell at clamped duty
+    // must never end as a heap on the ground.
+    float cap = (float)LEDGER_MAX_METRES * revsPerMetre;
+    if (logic.owedRevolutions >  cap) logic.owedRevolutions =  cap;
+    if (logic.owedRevolutions < -cap) logic.owedRevolutions = -cap;
+
+    // Where the ground has got to between two pulses, from the speed the seeder
+    // reports. Without it the debt would step by a whole pulse - about 2.5
+    // revolutions at the usual settings - and the target would saw up and down
+    // at the pulse rate. Capped at one pulse's distance, so a stale speed can
+    // never run away with it.
+    //
+    // A pulse is noticed at the end of the step it landed in, so the middle of
+    // that step is the unbiased guess for when it really arrived. Restarting
+    // from 0 would credit up to a step's worth of ground twice, which at the
+    // usual settings holds the rate about 1 % high for as long as it meters.
+    if (deltaPulses > 0) logic.ledgerSincePulseMs  = elapsed / 2;
+    else                 logic.ledgerSincePulseMs += elapsed;
+
+    float interpMm = (float)in.telemetry.groundSpeedMmS * (float)logic.ledgerSincePulseMs / 1000.0f;
+    if (interpMm > (float)mmPerPulse) interpMm = (float)mmPerPulse;
+
+    float effective = logic.owedRevolutions + (interpMm / 1000.0f) * revsPerMetre;
+    float catchRPM  = effective * 60.0f / LEDGER_CATCHUP_SECONDS;
+
+    if (catchRPM >  (float)LEDGER_MAX_CATCHUP_RPM) catchRPM =  (float)LEDGER_MAX_CATCHUP_RPM;
+    if (catchRPM < -(float)LEDGER_MAX_CATCHUP_RPM) catchRPM = -(float)LEDGER_MAX_CATCHUP_RPM;
+    return catchRPM;
 }
 
 // Clog check: the shaft turning slower than CLOG_MIN_SPEED_PERCENT of the
@@ -302,7 +409,25 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
 
             bool overSpeed = (required > MOTOR_MAX_RPM);
             if (overSpeed) required = MOTOR_MAX_RPM;   // clamp and complain, don't hide it
-            logic.targetRPM = (uint16_t)required;
+
+            // The rate above is the feed-forward; the ledger corrects the total
+            // applied. overSpeed is decided on the rate alone, just above, so
+            // the catch-up can neither raise nor clear ZA SZYBKO.
+            float   catchRPM = ledgerCatchupRPM(logic, in, elapsed,
+                                                revolutionsPerMetre(dose, calib), overSpeed);
+            int32_t target   = (int32_t)required +
+                               (int32_t)(catchRPM + (catchRPM >= 0.0f ? 0.5f : -0.5f));
+
+            // Repaying an over-application must never stop the auger while the
+            // machine is moving: an unfertilised strip is a permanent defect
+            // and nothing alarms on it, so a ledger that has gone negative -
+            // through a real over-application, or through an encoder counting
+            // edges that never happened - can take the rate down to half and no
+            // further. Repayment then simply takes longer.
+            int32_t floorRPM = (int32_t)(required / 2);
+            if (target < floorRPM)               target = floorRPM;
+            if (target > (int32_t)MOTOR_MAX_RPM) target = (int32_t)MOTOR_MAX_RPM;
+            logic.targetRPM = (uint16_t)target;
 
             next.motorPermille = computeDuty(logic, logic.targetRPM, elapsed);
             next.motorForward  = true;

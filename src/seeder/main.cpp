@@ -137,8 +137,15 @@ static void sendTelemetry(uint32_t nowMs)
     uint8_t  count           = copyWheelPulses(wheelPulses, recentUs);
     portEXIT_CRITICAL(&wheelLock);
 
+    // Distance per pulse comes from the tractor: the sensor is on the metering
+    // drive, so it depends on which seed-size gear the machine is in. Held
+    // after the tractor goes quiet, like the relay state; the default covers
+    // "never heard from it at all".
+    uint16_t mmPerPulse = haveCommand ? validWheelMmPerPulse(latestCommand.wheelMmPerPulse)
+                                      : WHEEL_MM_PER_PULSE_DEFAULT;
+
     // Clock read after the copy, so it is never earlier than the newest pulse.
-    uint16_t speed = wheelSpeedMmS(recentUs, count, (uint64_t)esp_timer_get_time());
+    uint16_t speed = wheelSpeedMmS(recentUs, count, (uint64_t)esp_timer_get_time(), mmPerPulse);
 
     SeederTelemetry telemetry;
     fillHeader(telemetry.header, MsgType::SeederTelemetry, NodeId::Seeder, links.flags());

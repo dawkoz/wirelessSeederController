@@ -468,7 +468,8 @@ static void printMenu()
 {
     Serial.println();
     Serial.println("--- menu ------------------------------------------------------------------");
-    Serial.println("  d  logic tests (D01-D35, no hardware)");
+    Serial.println("  d  logic tests (D01-D35 and the ledger, L01-L12, no hardware)");
+    Serial.println("  w  ground speed from wheel pulses (W01-W11, no hardware)");
     Serial.println("  v  packet tests (V01-V08, no motor)");
     Serial.println("  h  hardware (H00-H07, motor: read the checklist first)");
     Serial.println("  m  metering and links (M01-M10, motor)");
@@ -510,6 +511,7 @@ static bool askMotorChecklist()
 // ---------------------------------------------------------------------------
 
 #include "tests_logic.h"
+#include "tests_wheel.h"
 #include "tests_packets.h"
 #include "tests_hardware.h"
 #include "tests_scenarios.h"
@@ -580,6 +582,9 @@ void loop()
         case 'd':
             runLogicTests();
             break;
+        case 'w':
+            runWheelTests();
+            break;
         case 'v':
             runPacketTests();
             break;
@@ -598,6 +603,7 @@ void loop()
         case 'a':
             abortRequested = false;
             runLogicTests();
+            if (!abortRequested) runWheelTests();
             if (!abortRequested) runPacketTests();
             if (!abortRequested) runHardwareTests();
             if (!abortRequested) runMeteringTests();

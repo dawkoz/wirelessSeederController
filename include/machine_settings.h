@@ -44,15 +44,35 @@ static constexpr uint8_t RELAY_OFF = HIGH;
 
 // --- Ground wheel -----------------------------------------------------------
 
-// MEASURE: push the seeder along a measured 100 m and count the wheel pulses,
-// then WHEEL_MM_PER_PULSE = 100000 / pulses.
-// Until then, an estimate: 600 mm wheel x 3.14 / 3 magnets.
-static constexpr uint32_t WHEEL_MM_PER_PULSE = 628;
+// Distance travelled between two wheel-sensor pulses. The sensor is on the
+// metering drive, not on the ground wheel, so this depends on which seed-size
+// gear the machine is in: the tractor keeps one measured value per setting and
+// sends the active one in every packet (TractorCommand.wheelMmPerPulse). The
+// default below is only used until the first command arrives, and as the
+// fallback for a value outside the limits.
+// MEASURE: Nasiona -> Kalibracja on the tractor does it, once per seed size.
+static constexpr uint16_t WHEEL_MM_PER_PULSE_DEFAULT = 785;   // 6 magnets, ratio 0.4, 600 mm wheel
+static constexpr uint16_t WHEEL_MM_PER_PULSE_MIN     = 100;
+static constexpr uint16_t WHEEL_MM_PER_PULSE_MAX     = 5000;
 
-static constexpr uint8_t  WHEEL_MAGNETS           = 3;
+static constexpr uint8_t  WHEEL_MAGNETS           = 6;       // three more fitted to halve the gap between pulses
 static constexpr uint8_t  WHEEL_AVERAGE_INTERVALS = 6;       // speed is averaged over this many gaps between pulses
-static constexpr uint32_t WHEEL_STOP_TIMEOUT_MS   = 2000;    // no pulse for this long = stopped
-static constexpr uint32_t WHEEL_MIN_PULSE_GAP_US  = 40000;   // shorter gaps are electrical noise (40 ms is over 50 km/h)
+
+// The slowest speed this sensor still calls "moving". A pulse that has not
+// arrived within (distance per pulse / this) means the machine has stopped: at
+// any higher speed it would already be here. One number with a physical
+// meaning, in place of the old fixed 2 s timeout - which, on the metering drive
+// with 6 magnets, called a machine moving at 1.4 km/h stopped. The cost of
+// lowering it is that a real stop takes (distance per pulse / this) to notice:
+// 2.6 s at the default distance.
+static constexpr uint16_t WHEEL_MIN_SPEED_MM_S = 300;        // ~1.1 km/h
+
+static constexpr uint32_t WHEEL_MAX_SPEED_MM_S = 11000;      // ~40 km/h, above any road speed
+// A gap shorter than this is electrical noise, not a pulse. Derived from the
+// default distance per pulse rather than the calibrated one: it is read in the
+// ISR, so it has to be a compile-time constant.
+static constexpr uint32_t WHEEL_MIN_PULSE_GAP_US =
+    (uint32_t)((uint64_t)WHEEL_MM_PER_PULSE_DEFAULT * 1000000ULL / WHEEL_MAX_SPEED_MM_S);
 
 // Whole wheel turns only, so uneven spacing between the magnets cancels out.
 static_assert(WHEEL_AVERAGE_INTERVALS > 0 && WHEEL_AVERAGE_INTERVALS % WHEEL_MAGNETS == 0,
@@ -105,6 +125,14 @@ static constexpr uint32_t LINK_BUZZER_DELAY_MS    = 5000;    // a lost link beep
 // interrupted.
 static constexpr uint32_t CALIBRATION_START_TIMEOUT_MS = 2000;
 
+// --- Wheel calibration (Nasiona -> Kalibracja) ------------------------------
+
+// Driven in the field with the machine working, so wheel slip is part of the
+// number. 100 m is about 128 pulses at the default distance; 20 m would be 25,
+// where one pulse either way is a 4 % error.
+static constexpr uint16_t WHEEL_CALIB_DISTANCE_M = 100;
+static constexpr uint16_t WHEEL_CALIB_MIN_PULSES = 50;    // below this the result is refused
+
 // --- First-boot values, until changed on the Dawka and Kalibracja screens ---
 
 static constexpr uint16_t DEFAULT_DOSE_KG_PER_HA   = 40;
@@ -143,6 +171,18 @@ static constexpr uint32_t MOTOR_CONTROL_INTERVAL_MS = 100;
 static constexpr float    MOTOR_KP                  = 0.8f;
 static constexpr float    MOTOR_KI                  = 0.4f;
 static constexpr float    MOTOR_INTEGRAL_LIMIT      = 400.0f;
+
+// --- Distance ledger --------------------------------------------------------
+
+// The dispenser meters to distance, not to speed: every wheel pulse is a fixed
+// distance and therefore a fixed number of shaft turns, and the encoder says
+// how many it has actually made. The difference - the debt - is paid off over
+// LEDGER_CATCHUP_SECONDS. The speed-based rate is still the feed-forward; this
+// only removes the error it leaves behind (a speed average that lags a whole
+// metering turn, and the first seconds after every start).
+static constexpr float    LEDGER_CATCHUP_SECONDS = 5.0f;
+static constexpr uint16_t LEDGER_MAX_CATCHUP_RPM = 60;    // never more than this above or below the rate
+static constexpr uint16_t LEDGER_MAX_METRES      = 10;    // debt cap, in metres of travel
 
 // --- Clog alarm -------------------------------------------------------------
 

@@ -31,7 +31,11 @@ static constexpr uint8_t PROTOCOL_MAGIC_1 = 'S';
 // v4: clog alarm and unclogging - DispenserMode replaces the old calibration
 //     state enum, TractorCommand carries counters for Anuluj/Odetkaj and the
 //     tractor's upTimeMs.
-static constexpr uint8_t PROTOCOL_VERSION = 4;
+// v5: TractorCommand carries wheelMmPerPulse. The wheel sensor turned out to be
+//     on the metering drive, whose ratio to the ground wheel depends on the
+//     seed-size gear, so the distance per pulse is an operator setting - one
+//     measured value per gear - instead of a constant.
+static constexpr uint8_t PROTOCOL_VERSION = 5;
 
 static const uint8_t BROADCAST_ADDRESS[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -119,8 +123,22 @@ struct __attribute__((packed)) TractorCommand {
     // survives loss and is acted on exactly once per change. The dispenser
     // ignores a change that arrives right after a link gap or a tractor reboot
     // (the resync rule in dispenser_logic.h), so it never acts on boot.
+    uint16_t wheelMmPerPulse;    // distance covered between two wheel pulses,
+                                 // for the seed-size gear the operator has
+                                 // selected. The seeder turns pulses into
+                                 // speed with it, the dispenser turns them into
+                                 // distance. Never sent as 0; see below.
 };
-static_assert(sizeof(TractorCommand) == 24, "TractorCommand layout changed - reflash ALL boards");
+static_assert(sizeof(TractorCommand) == 26, "TractorCommand layout changed - reflash ALL boards");
+
+// Both receivers clamp the wire value the same way: anything outside the limits
+// - including the 0 a board that does not set it yet would send - falls back to
+// the default rather than metering on nonsense.
+inline uint16_t validWheelMmPerPulse(uint16_t value)
+{
+    if (value < WHEEL_MM_PER_PULSE_MIN || value > WHEEL_MM_PER_PULSE_MAX) return WHEEL_MM_PER_PULSE_DEFAULT;
+    return value;
+}
 
 // Dispenser -> everyone
 struct __attribute__((packed)) DispenserStatus {

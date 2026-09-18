@@ -27,6 +27,12 @@ struct DHarness {
     double   edgeCarry = 0.0;
     double   shaftRPM  = 0.0;
 
+    // The simulated seeder's cumulative wheel counter, advanced from the speed
+    // it reports so that the dispenser's distance ledger and its rate maths see
+    // the same ground. mmPerPulse is what the simulated tractor sends.
+    double   pulseCarry = 0.0;
+    uint16_t mmPerPulse = WHEEL_MM_PER_PULSE_DEFAULT;
+
     bool            seederAlive   = false;
     bool            haveTelemetry = false;
     SeederTelemetry telemetry     = {};
@@ -62,6 +68,8 @@ static void dFresh(DHarness &h)
     h.edges     = 0;
     h.edgeCarry = 0.0;
     h.shaftRPM  = 0.0;
+    h.pulseCarry = 0.0;
+    h.mmPerPulse = WHEEL_MM_PER_PULSE_DEFAULT;
 
     h.seederAlive   = false;
     h.haveTelemetry = false;
@@ -118,6 +126,18 @@ static bool dStep(DHarness &h, uint32_t stepMs = MOTOR_CONTROL_INTERVAL_MS)
     uint32_t whole = (uint32_t)h.edgeCarry;
     h.edgeCarry -= (double)whole;
     h.edges += whole;
+
+    // Wheel pulses for the distance ledger: whole pulses only, from the speed
+    // the simulated seeder is reporting, through a fractional accumulator so a
+    // long run cannot drift.
+    if (h.telemetry.wheelTurning != 0 && h.telemetry.groundSpeedMmS > 0 && h.mmPerPulse > 0) {
+        h.pulseCarry += (double)h.telemetry.groundSpeedMmS * (double)stepMs
+                        / 1000.0 / (double)h.mmPerPulse;
+        uint32_t wholePulses = (uint32_t)h.pulseCarry;
+        h.pulseCarry -= (double)wholePulses;
+        h.telemetry.wheelPulses += wholePulses;
+    }
+    h.command.wheelMmPerPulse = h.mmPerPulse;
 
     h.nowMs += stepMs;
     h.command.upTimeMs = (uint32_t)((int64_t)h.nowMs + h.upTimeOffset);
@@ -311,7 +331,8 @@ static void testD03()
     dDefaults(h);
 
     // The catalogue's own expectation: the duty a correct feed-forward gives at
-    // 192 RPM, +-30 permille once the loop has settled.
+    // 192 RPM, +-40 permille once the loop has settled. The window was 30
+    // before the distance ledger, which trims the target while it settles.
     const double expectedDuty = 192.0 * 1000.0 / (double)MOTOR_MAX_RPM;
     bool ok = true;
     double worst = 0.0;
@@ -323,17 +344,21 @@ static void testD03()
         if (i >= 10) {
             if (h.logic.mode != DispenserMode::Normal) ok = false;
             if (h.logic.fault != DispenserFault::None) ok = false;
-            if (h.logic.targetRPM != 192) ok = false;
+            // Not exactly 192 any more: the distance ledger trims the target by
+            // a couple of RPM either way, and a little more in the first second
+            // while it settles (see the L tests). The duty limit below is what
+            // actually pins the feed-forward down.
+            if (fabs((double)h.logic.targetRPM - 192.0) > 8.0) ok = false;
             if (!h.out.motorForward) ok = false;
 
             double deviation = fabs((double)h.out.motorPermille - expectedDuty);
             if (deviation > worst) worst = deviation;
-            if (deviation > 30.0) ok = false;
+            if (deviation > 40.0) ok = false;
         }
         dCheckStatus(h);
     }
 
-    reportCheck("D03", ok, "step 10+: target 192, duty %.0f +-30 (worst %.0f), forward, fault None",
+    reportCheck("D03", ok, "step 10+: target 192 +-8, duty %.0f +-40 (worst %.0f), forward, fault None",
                 expectedDuty, worst);
 }
 
@@ -429,28 +454,32 @@ static void testD05()
 
 static void testD06()
 {
+    // The rule is a fraction of the COMMANDED speed, and the command now
+    // includes the distance ledger's catch-up: a shaft that keeps up 36 % of
+    // whatever it is asked for must never clog, wherever the ledger moves the
+    // target. Hence a fraction of logic.targetRPM rather than a fixed 69 RPM.
     DHarness h;
     dFresh(h);
     dDefaults(h);
-    h.shaftRPM = 69;   // 36 % of 192
 
     bool ok = true;
     for (int i = 0; i < 50; i++) {
         dStep(h);
+        h.shaftRPM = 0.36 * (double)h.logic.targetRPM;
         if (h.logic.mode == DispenserMode::Clogged) ok = false;
     }
-    reportCheck("D06a", ok, "69 RPM (36 %%) never Clogged over 50 steps");
+    reportCheck("D06a", ok, "36 %% of the commanded speed never Clogged over 50 steps");
 
     DHarness g;
     dFresh(g);
     dDefaults(g);
-    g.shaftRPM = 57;   // 30 % of 192
 
     bool sawSlow = false, sawClog = false;
     bool okB = true;
     uint32_t tSlow = 0, tClog = 0;
     for (int i = 0; i < 40; i++) {
         dStep(g);
+        g.shaftRPM = 0.30 * (double)g.logic.targetRPM;
         if (!sawSlow) { sawSlow = true; tSlow = g.nowMs; }
         if (g.logic.mode == DispenserMode::Clogged && !sawClog) {
             sawClog = true;
@@ -458,7 +487,7 @@ static void testD06()
         }
     }
     okB = sawClog && ((tClog - tSlow) == CLOG_DETECT_MS);
-    reportCheck("D06b", okB, "57 RPM (30 %%) Clogged after %lu ms (want %lu)",
+    reportCheck("D06b", okB, "30 %% of the commanded speed Clogged after %lu ms (want %lu)",
                 (unsigned long)(tClog - tSlow), (unsigned long)CLOG_DETECT_MS);
 }
 
@@ -1258,19 +1287,24 @@ static void testD29()
     h.shaftRPM = 0;
     dStep(h);
 
-    // The row's limit is min(1000, 192 x 1000 / MOTOR_MAX_RPM + MOTOR_KP x 192) - 50.
-    // Starting from MOTOR_MAX_RPM instead of 1000 makes the limit 280 permille,
-    // which a controller with no anti-windup (~343) would pass - exactly what
-    // this test exists to catch.
+    // Feed-forward plus the P term for the target the logic actually commanded,
+    // less 50. The target is not simply 192: a minute of the shaft turning far
+    // faster than the ground asked for is a real over-application, and the
+    // distance ledger takes it off the rate until it is repaid. Starting from
+    // MOTOR_MAX_RPM rather than 1000 keeps the limit low enough that a
+    // controller with no anti-windup would still pass it - which is exactly
+    // what this test exists to catch.
+    double target     = (double)h.logic.targetRPM;
     double floorValue = 1000.0;
-    double byFormula = 192.0 * 1000.0 / (double)MOTOR_MAX_RPM + MOTOR_KP * 192.0;
+    double byFormula  = target * 1000.0 / (double)MOTOR_MAX_RPM + MOTOR_KP * target;
     if (byFormula < floorValue) floorValue = byFormula;
     floorValue -= 50.0;
 
     if ((double)h.out.motorPermille < floorValue) ok = false;
 
-    reportCheck("D29", ok, "after 60 s at a 4 RPM target the duty recovers to %u (want >= %.0f)",
-                (unsigned)h.out.motorPermille, floorValue);
+    reportCheck("D29", ok, "after 60 s at a 4 RPM target the duty recovers to %u "
+                "(want >= %.0f at the commanded %u RPM)",
+                (unsigned)h.out.motorPermille, floorValue, (unsigned)h.logic.targetRPM);
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,11 +1374,12 @@ static void testD33()
     DHarness h;
     dFresh(h);
     dDefaults(h);
-    h.shaftRPM = 70;
 
+    // Slow but not clogged: 36 % of whatever is commanded (see D06).
     bool ok = true;
     for (int i = 0; i < 80; i++) {
         dStep(h);
+        h.shaftRPM = 0.36 * (double)h.logic.targetRPM;
         if (h.logic.mode == DispenserMode::Clogged) ok = false;
     }
 
@@ -1411,8 +1446,12 @@ static void testD35()
     DHarness h;
     dFresh(h);
     dDefaults(h);
-    h.telemetry.groundSpeedMmS = 1719;   // asks for 330 RPM, the motor's maximum
-    h.shaftRPM = 363;                    // ... and the motor runs faster than asked
+    // 2000 mm/s asks for 384 RPM, past the motor's maximum, so the rate is
+    // clamped to MOTOR_MAX_RPM and the distance ledger deliberately takes no
+    // part (a debt earned at the motor's limit is unrepayable). What is left is
+    // the integral, which is what this test is about.
+    h.telemetry.groundSpeedMmS = 2000;
+    h.shaftRPM = 363;                    // and the motor runs faster than asked
 
     bool ok = true;
     for (int i = 0; i < 300; i++) {
@@ -1445,6 +1484,354 @@ static void testD35()
                 "%u permille in each of the next 3 steps (lowest %u)",
                 (double)integralBefore, (unsigned)h.logic.targetRPM,
                 (unsigned)MOTOR_MIN_RUNNING_PERMILLE, (unsigned)worst);
+}
+
+// ---------------------------------------------------------------------------
+// L tests - the distance ledger. Metering follows the ground, so what these
+// check is the total delivered over a distance, not the speed at an instant.
+// The harness advances the simulated seeder's wheelPulses from the speed it
+// reports (see dStep), which is the same ground the rate maths sees.
+// ---------------------------------------------------------------------------
+
+// Revolutions per metre for the defaults: 4 m at 40 kg/ha with 500 g/100 rev.
+static double lRevsPerMetre(const DHarness &h)
+{
+    return (double)WORKING_WIDTH_CM * (double)h.command.doseKgPerHa /
+           (10.0 * (double)h.command.gramsPer100Rev);
+}
+
+static double lMetres(const DHarness &h, uint32_t sincePulses)
+{
+    return (double)(h.telemetry.wheelPulses - sincePulses) * (double)h.mmPerPulse / 1000.0;
+}
+
+static double lTurns(const DHarness &h, uint32_t sinceEdges)
+{
+    return (double)(h.edges - sinceEdges) / (double)ENCODER_EDGES_PER_REV;
+}
+
+// L01 - a shaft that does exactly what it is told leaves no debt worth acting
+// on. Without the between-pulse interpolation the target would saw up and down
+// by about 30 RPM here, once per pulse.
+static void testL01()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    double worstDebt   = 0.0;
+    double worstTarget = 0.0;
+
+    for (int i = 0; i < 300; i++) {
+        dStep(h);
+        dFollow(h);
+        if (i < 20) continue;      // let the first pulses arrive
+        double debt = fabs((double)h.logic.owedRevolutions);
+        if (debt > worstDebt) worstDebt = debt;
+        double off = fabs((double)h.logic.targetRPM - 192.0);
+        if (off > worstTarget) worstTarget = off;
+    }
+
+    bool ok = (worstDebt <= 3.5) && (worstTarget <= 12.0);
+    reportCheck("L01", ok, "shaft on target: debt at most %.2f rev (limit 3.5), target within "
+                "%.0f RPM of 192 (limit 12)", worstDebt, worstTarget);
+}
+
+// L02 - the case the ledger exists for: a motor that runs faster than it is
+// told. The rate alone would over-apply by 15 % for ever; the ledger takes it
+// off the target until the total is right.
+static void testL02()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    uint32_t edges0  = h.edges;
+    uint32_t pulses0 = h.telemetry.wheelPulses;
+
+    for (int i = 0; i < 600; i++) {          // 60 s
+        dStep(h);
+        h.shaftRPM = 1.15 * (double)h.logic.targetRPM;
+    }
+
+    double turns = lTurns(h, edges0);
+    double want  = lMetres(h, pulses0) * lRevsPerMetre(h);
+    bool   ok    = fabs(turns - want) <= 0.03 * want;
+
+    reportCheck("L02", ok, "motor 15 %% fast: %.1f turns over %.1f m (want %.1f +-3 %%)",
+                turns, lMetres(h, pulses0), want);
+}
+
+// L03 - a shaft that cannot keep up raises the target, but never by more than
+// the catch-up limit.
+static void testL03()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    double worstCatch = 0.0;
+    bool   ok = true;
+
+    for (int i = 0; i < 300; i++) {
+        dStep(h);
+        h.shaftRPM = 0.70 * (double)h.logic.targetRPM;   // slow, but well clear of a clog
+        if (h.logic.mode == DispenserMode::Clogged) ok = false;
+        double catchRPM = (double)h.logic.targetRPM - 192.0;
+        if (catchRPM > worstCatch) worstCatch = catchRPM;
+    }
+
+    if (worstCatch > (double)LEDGER_MAX_CATCHUP_RPM) ok = false;
+    if (worstCatch < 10.0)                           ok = false;   // it has to have tried
+
+    reportCheck("L03", ok, "shaft 30 %% slow: target rose by %.0f RPM (limit %u), never Clogged",
+                worstCatch, (unsigned)LEDGER_MAX_CATCHUP_RPM);
+}
+
+// L04 - the debt cap. A minute of a shaft that will not keep up must not build
+// a debt that could later be dumped in one place.
+static void testL04()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    double worstDebt = 0.0;
+    for (int i = 0; i < 600; i++) {
+        dStep(h);
+        h.shaftRPM = 0.40 * (double)h.logic.targetRPM;
+        double debt = (double)h.logic.owedRevolutions;
+        if (debt > worstDebt) worstDebt = debt;
+    }
+
+    double cap = (double)LEDGER_MAX_METRES * lRevsPerMetre(h);
+    bool   ok  = (worstDebt <= cap + 0.01) && (worstDebt > 0.5 * cap);
+
+    reportCheck("L04", ok, "60 s of a shaft at 40 %%: debt %.1f rev, cap %.1f rev",
+                worstDebt, cap);
+}
+
+// L05 - the seeder disappears and comes back. The machine kept moving, but that
+// ground is gone: the first step back must add no debt and ask for the rate.
+static void testL05()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    for (int i = 0; i < 50; i++) { dStep(h); dFollow(h); }
+
+    h.seederAlive = false;
+    for (int i = 0; i < 20; i++) { dStep(h); }        // NoSpeedData, motor off
+
+    h.seederAlive = true;
+    dStep(h);                                        // first metering step back
+
+    bool ok = (h.logic.targetRPM == 192) && (fabs((double)h.logic.owedRevolutions) < 0.01);
+
+    reportCheck("L05", ok, "seeder back: target %u (want 192), debt %.2f rev (want 0)",
+                (unsigned)h.logic.targetRPM, (double)h.logic.owedRevolutions);
+}
+
+// L06 - the seeder reboots and its cumulative counter restarts. Read as a
+// delta that would be a huge debt and a burst of fertilizer.
+static void testL06()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    for (int i = 0; i < 50; i++) { dStep(h); dFollow(h); }
+
+    h.telemetry.wheelPulses = 0;     // the seeder restarted
+    dStep(h);
+    dFollow(h);
+
+    bool ok = (fabs((double)h.logic.owedRevolutions) < 3.5) &&
+              (fabs((double)h.logic.targetRPM - 192.0) <= 12.0);
+
+    for (int i = 0; i < 100; i++) {  // and it keeps working afterwards
+        dStep(h);
+        dFollow(h);
+        if (fabs((double)h.logic.owedRevolutions) > 3.5) ok = false;
+    }
+
+    reportCheck("L06", ok, "seeder counter restarted: debt %.2f rev, target %u",
+                (double)h.logic.owedRevolutions, (unsigned)h.logic.targetRPM);
+}
+
+// L07 - the same, at the 2^32 wrap. It cannot happen in this machine's life
+// (about 1.3 pulses per metre), but it must not misbehave if it does.
+static void testL07()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    h.telemetry.wheelPulses = 0xFFFFFFF0u;
+    bool ok = true;
+
+    for (int i = 0; i < 200; i++) {
+        dStep(h);
+        dFollow(h);
+        if (fabs((double)h.logic.owedRevolutions) > 3.5) ok = false;
+        if (h.logic.targetRPM > MOTOR_MAX_RPM)           ok = false;
+    }
+
+    reportCheck("L07", ok, "across the counter wrap: debt %.2f rev, target %u",
+                (double)h.logic.owedRevolutions, (unsigned)h.logic.targetRPM);
+}
+
+// L08 - a stop wipes the debt. The fertilizer it stands for belongs to ground
+// the machine has already left, so paying it off after the stop would put a
+// heap where the machine starts again.
+static void testL08()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    for (int i = 0; i < 100; i++) {            // build a real debt
+        dStep(h);
+        h.shaftRPM = 0.40 * (double)h.logic.targetRPM;
+    }
+    bool ok = ((double)h.logic.owedRevolutions > 1.0);   // there was something to lose
+
+    h.telemetry.wheelTurning   = 0;            // headland
+    h.telemetry.groundSpeedMmS = 0;
+    h.shaftRPM = 0;
+    for (int i = 0; i < 20; i++) {
+        dStep(h);
+        if (h.out.motorPermille != 0) ok = false;
+    }
+    if (fabs((double)h.logic.owedRevolutions) > 0.01) ok = false;
+
+    h.telemetry.wheelTurning   = 1;            // moving again
+    h.telemetry.groundSpeedMmS = 1000;
+    dStep(h);                                  // first metering step
+    if (h.logic.targetRPM != 192) ok = false;
+
+    reportCheck("L08", ok, "stop clears the debt: %.2f rev, and the restart asks for %u RPM",
+                (double)h.logic.owedRevolutions, (unsigned)h.logic.targetRPM);
+}
+
+// L09 - unclogging turns the shaft backwards and the encoder counts those edges
+// up like any other. They must never be read as fertilizer delivered.
+static void testL09()
+{
+    DHarness h;
+    if (!dReachClogged(h)) {
+        reportCheck("L09", false, "never reached Clogged");
+        return;
+    }
+
+    dSetCounters(h, 0, 1);            // Odetkaj
+    dStep(h);
+    bool ok = (h.logic.mode == DispenserMode::Unclogging);
+
+    h.shaftRPM = 300;                 // the sequence turns the shaft, both ways
+    for (int i = 0; i < 30; i++) dStep(h);
+
+    dSetCounters(h, 1, 1);            // Anuluj
+    dStep(h);
+    if (h.logic.mode != DispenserMode::Normal) ok = false;
+
+    dStep(h);                         // first metering step after the sequence
+    if (h.logic.targetRPM != 192) ok = false;
+    if (fabs((double)h.logic.owedRevolutions) > 0.01) ok = false;
+
+    reportCheck("L09", ok, "after unclogging: target %u (want 192), debt %.2f rev (want 0)",
+                (unsigned)h.logic.targetRPM, (double)h.logic.owedRevolutions);
+}
+
+// L10 - over-speed. The motor is already at its limit, so the debt it would run
+// up is unrepayable: none is recorded, and slowing down brings no burst.
+static void testL10()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+    h.telemetry.groundSpeedMmS = 2000;      // asks for 384 RPM
+    h.shaftRPM = 330;
+
+    bool ok = true;
+    for (int i = 0; i < 200; i++) {
+        dStep(h);
+        if (h.logic.targetRPM != MOTOR_MAX_RPM)        ok = false;
+        if (h.logic.fault != DispenserFault::OverSpeed) ok = false;
+        if (h.logic.owedRevolutions != 0.0f)            ok = false;
+    }
+
+    // Back within reach. Resuming the count credits the next whole pulse, part
+    // of which is ground covered during the over-speed - one pulse of debt at
+    // most, so the rate comes back near 192 rather than exactly to it, and no
+    // burst follows.
+    h.telemetry.groundSpeedMmS = 1000;
+    double worstAfter = 0.0;
+    for (int i = 0; i < 60; i++) {
+        dStep(h);
+        dFollow(h);
+        double off = fabs((double)h.logic.targetRPM - 192.0);
+        if (off > worstAfter) worstAfter = off;
+    }
+    if (worstAfter > 30.0) ok = false;
+
+    reportCheck("L10", ok, "20 s over-speed: no debt while clamped, then the rate comes back "
+                "within %.0f RPM of 192 (limit 30)", worstAfter);
+}
+
+// L11 - the whole point, over a pass: 140 m at three speeds with a motor that
+// runs 10 % fast. What lands on the ground has to match the distance.
+static void testL11()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    uint32_t edges0  = h.edges;
+    uint32_t pulses0 = h.telemetry.wheelPulses;
+
+    const uint16_t speeds[3] = {500, 1500, 800};
+    for (uint8_t phase = 0; phase < 3; phase++) {
+        h.telemetry.groundSpeedMmS = speeds[phase];
+        for (int i = 0; i < 500; i++) {     // 50 s each
+            dStep(h);
+            h.shaftRPM = 1.10 * (double)h.logic.targetRPM;
+        }
+    }
+
+    double metres = lMetres(h, pulses0);
+    double turns  = lTurns(h, edges0);
+    double want   = metres * lRevsPerMetre(h);
+    bool   ok     = fabs(turns - want) <= 0.02 * want;
+
+    reportCheck("L11", ok, "%.0f m at three speeds: %.1f turns (want %.1f +-2 %%)",
+                metres, turns, want);
+}
+
+// L12 - the dose changes mid-pass. The debt is in revolutions, so only new
+// ground is costed at the new rate; the target must follow within a step or two
+// without a jump.
+static void testL12()
+{
+    DHarness h;
+    dFresh(h);
+    dDefaults(h);
+
+    for (int i = 0; i < 200; i++) { dStep(h); dFollow(h); }
+
+    h.command.doseKgPerHa = 50;         // 192 -> 240 RPM
+    bool ok = true;
+    for (int i = 0; i < 50; i++) {
+        dStep(h);
+        dFollow(h);
+        if (h.logic.targetRPM > MOTOR_MAX_RPM) ok = false;
+    }
+    if (fabs((double)h.logic.targetRPM - 240.0) > 15.0)  ok = false;
+    if (fabs((double)h.logic.owedRevolutions) > 4.5)     ok = false;
+
+    reportCheck("L12", ok, "dose 40 -> 50: target %u (want 240 +-15), debt %.2f rev",
+                (unsigned)h.logic.targetRPM, (double)h.logic.owedRevolutions);
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,4 +1881,19 @@ static void runLogicTests()
 
     reportCheck("D32", d32Ok && d32Count > 0,
                 "dispenserFillStatus matched the step over %u checks", (unsigned)d32Count);
+
+    Serial.println("--- L: distance ledger (no hardware) ---");
+
+    testL01();
+    testL02();
+    testL03();
+    testL04();
+    testL05();
+    testL06();
+    testL07();
+    testL08();
+    testL09();
+    testL10();
+    testL11();
+    testL12();
 }

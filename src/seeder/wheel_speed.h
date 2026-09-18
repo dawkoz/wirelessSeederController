@@ -41,10 +41,17 @@ inline uint8_t copyWheelPulses(const WheelPulses &pulses, uint64_t recentUs[])
 }
 
 // Speed in mm/s from times given newest first, as copyWheelPulses returns
-// them. nowUs must not be earlier than the newest pulse.
-inline uint16_t wheelSpeedMmS(const uint64_t recentUs[], uint8_t count, uint64_t nowUs)
+// them. nowUs must not be earlier than the newest pulse. mmPerPulse is the
+// distance covered between two pulses for the seed-size gear in use, which the
+// tractor sends in every command - the sensor is on the metering drive, so it
+// is not a constant of the machine.
+inline uint16_t wheelSpeedMmS(const uint64_t recentUs[], uint8_t count, uint64_t nowUs, uint16_t mmPerPulse)
 {
-    const uint64_t stopUs = (uint64_t)WHEEL_STOP_TIMEOUT_MS * 1000ULL;
+    // No pulse for this long means stopped: at WHEEL_MIN_SPEED_MM_S one would
+    // already have arrived. It scales with the calibration instead of being a
+    // fixed timeout, and it does both jobs - "stopped now", and "there was a
+    // stop inside the averaging window".
+    const uint64_t stopUs = (uint64_t)mmPerPulse * 1000000ULL / WHEEL_MIN_SPEED_MM_S;
 
     if (count < 2) return 0;
 
@@ -64,13 +71,18 @@ inline uint16_t wheelSpeedMmS(const uint64_t recentUs[], uint8_t count, uint64_t
     uint64_t spanUs = recentUs[0] - recentUs[gaps];
     if (spanUs == 0) return 0;
 
-    uint64_t speed = (uint64_t)gaps * WHEEL_MM_PER_PULSE * 1000000ULL / spanUs;
+    uint64_t speed = (uint64_t)gaps * mmPerPulse * 1000000ULL / spanUs;
 
     // If the next pulse is late, the wheel has slowed: lower the speed now
-    // rather than holding it until the stop timeout. Late means later than
+    // rather than holding it until the stop rule fires. Late means later than
     // the gap between the same two magnets one wheel turn ago, so uneven
     // magnet spacing can't cause a false drop. Before the first full turn,
     // the newest gap is the only reference there is.
+    //
+    // The two rules meet exactly: at a steady speed the decayed value reaches
+    // WHEEL_MIN_SPEED_MM_S at the moment sinceLastUs reaches stopUs, so the
+    // speed slides down to the stop instead of stepping to 0 from wherever it
+    // happened to be.
     uint64_t expectedUs = (gaps >= WHEEL_MAGNETS)
         ? recentUs[WHEEL_MAGNETS - 1] - recentUs[WHEEL_MAGNETS]
         : recentUs[0] - recentUs[1];

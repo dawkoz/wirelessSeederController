@@ -420,6 +420,39 @@ static void runMeteringTests()
                     lowOk ? "yes" : "NO", (unsigned)MOTOR_MIN_RUNNING_PERMILLE,
                     gSawBuzzingDuty ? "NO" : "yes", rpm, want);
     }
+
+    // M11 - the distance ledger with the real motor. Everything else here
+    // measures a speed at an instant; this measures what the shaft actually
+    // delivered over a stretch of simulated ground, which is what the dose is.
+    if (abortRequested) return;
+    {
+        TestMarker tm("M11");
+        MotorGuard guard;
+
+        if (!benchPrepare()) { reportLine("M11", Outcome::Aborted, "aborted by key"); return; }
+        injectorDefaults(injector);
+        injectorStart(injector, millis());
+
+        // Up to speed first: the start transient is the ledger's to correct,
+        // but it belongs to the metres before the measurement, not inside it.
+        if (!runFor(3000)) { reportLine("M11", Outcome::Aborted, "aborted by key"); return; }
+
+        uint32_t edges0  = encoderEdges();
+        uint32_t pulses0 = injector.seeder.wheelPulses;
+
+        if (!runFor(20000)) { reportLine("M11", Outcome::Aborted, "aborted by key"); return; }
+
+        double turns  = (double)(encoderEdges() - edges0) / (double)ENCODER_EDGES_PER_REV;
+        double metres = (double)(injector.seeder.wheelPulses - pulses0) *
+                        (double)injector.tractor.wheelMmPerPulse / 1000.0;
+        double want   = metres * (double)WORKING_WIDTH_CM * (double)injector.tractor.doseKgPerHa /
+                        (10.0 * (double)injector.tractor.gramsPer100Rev);
+
+        bool ok = (want > 0.0) && (fabs(turns - want) <= 0.03 * want);
+
+        reportCheck("M11", ok, "%.1f m of ground: %.1f shaft turns (want %.1f +-3 %%)",
+                    metres, turns, want);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -414,10 +414,11 @@ to fit it, and asks you to remove it before it does anything else.
 
 | Keys | What you need | What it proves |
 |---|---|---|
-| `d` | nothing connected | the decision logic, 35 checks, milliseconds |
+| `d` | nothing connected | the decision logic and the distance ledger, 35 + 12 checks, milliseconds |
+| `w` | nothing connected | ground speed from wheel pulses (the seeder's own logic), 11 checks |
 | `v` | nothing connected | packet validation, the inbox and the link timing |
 | `h` | coupling off, shaft free to turn | supply, driver, motor, both encoder channels, DIR, radio |
-| `m` | coupling off, shaft free | metering and every link-loss case, with the motor running |
+| `m` | coupling off, shaft free | metering and every link-loss case, with the motor running; M11 checks the turns delivered over simulated ground |
 | `c` | coupling off, shaft free | the 100-revolution calibration run |
 | `k` | coupling off; K07 needs the lever | clog detection and the unclog sequence |
 

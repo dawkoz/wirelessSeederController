@@ -49,6 +49,12 @@ struct SimTractor {
     uint8_t  clogClearSeq     = 0;
     uint8_t  unclogSeq        = 0;
 
+    // The simulated seeder turns its speed into wheelPulses with this same
+    // value, so the two sides of the dispenser's distance ledger agree - as
+    // they do on the machine, where the tractor sends the number both boards
+    // meter with.
+    uint16_t wheelMmPerPulse  = WHEEL_MM_PER_PULSE_DEFAULT;
+
     // upTimeMs = bench time + this offset, so a test can make it go backwards
     // (a tractor reboot) by lowering it.
     int32_t  upTimeOffset = 0;
@@ -130,6 +136,7 @@ static int buildTractorPacket(const Injector &inj, uint32_t now, uint8_t *buf)
     packet.upTimeMs         = (uint32_t)((int64_t)now + inj.tractor.upTimeOffset);
     packet.clogClearSeq     = inj.tractor.clogClearSeq;
     packet.unclogSeq        = inj.tractor.unclogSeq;
+    packet.wheelMmPerPulse  = inj.tractor.wheelMmPerPulse;
 
     memcpy(buf, &packet, sizeof(packet));
     return (int)sizeof(packet);
@@ -154,8 +161,8 @@ static void injectorPump(Injector &inj, uint32_t now)
         inj.seeder.lastSentMs = now;
 
         inj.seeder.distanceMm += (double)inj.seeder.groundSpeedMmS * (double)sinceLast / 1000.0;
-        while (inj.seeder.distanceMm >= (double)WHEEL_MM_PER_PULSE) {
-            inj.seeder.distanceMm -= (double)WHEEL_MM_PER_PULSE;
+        while (inj.seeder.distanceMm >= (double)inj.tractor.wheelMmPerPulse) {
+            inj.seeder.distanceMm -= (double)inj.tractor.wheelMmPerPulse;
             inj.seeder.wheelPulses++;
         }
 
