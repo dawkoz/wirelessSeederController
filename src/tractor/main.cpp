@@ -45,6 +45,7 @@ enum class Screen : uint8_t {
     SeedCalibAsk,     // "Kalibracja kola?" -> Anuluj / OK, screen 17
     SeedCalibRun,     // driving the measured distance, screen 18
     SeedCalibResult,  // the measured value, or why there isn't one, screen 19
+    Settings,         // everything stored, and the USB export, screen 20
 };
 
 // What is actually on the display. One Screen can show as several Views
@@ -72,6 +73,7 @@ enum class View : uint8_t {
     SeedCalibAsk,
     SeedCalibRun,
     SeedCalibResult,
+    Settings,
 };
 
 enum class MenuItem : uint8_t {
@@ -80,21 +82,22 @@ enum class MenuItem : uint8_t {
     Kalibracja = 2,
     Sciezki    = 3,
     Nasiona    = 4,
-    Count      = 5,
+    Ustawienia = 5,
+    Count      = 6,
 };
 
 // More items than rows, so the menu scrolls: four are drawn from menuTop, which
 // follows the cursor.
-static const char *const MENU_LABELS[] = {"Praca", "Dawka", "Kalibracja", "Sciezki", "Nasiona"};
+static const char *const MENU_LABELS[] = {"Praca", "Dawka", "Kalibracja", "Sciezki", "Nasiona", "Ustawienia"};
 static constexpr uint8_t MENU_VISIBLE_ROWS = 4;
 
+// What can take over the work screen. LinkLost is the exception: it is a letter
+// in the corner and the buzzer, never a full screen.
 enum class FaultCode : uint8_t {
     None,
-    TurbineOff,
-    WomOff,
-    WomWhileLifted,
+    TurbineOff,          // the fan has stopped while the machine is seeding
+    DispenserOverSpeed,  // driving faster than the dispenser can meter
     LinkLost,
-    DispenserOverSpeed,
 };
 
 enum class ButtonEvent : uint8_t { None, Short, Long };
@@ -136,9 +139,14 @@ static uint8_t tramlineCursor   = 0;      // screen 15: 0 = the switch, 1 = ZAPI
 // the ground wheel and the ratio depends on the gear. Both values are measured
 // by driving WHEEL_CALIB_DISTANCE_M (screens 16-19) and kept in NVS; the active
 // one goes out in every command, and the seeder and dispenser meter with it.
-static uint16_t wheelMmSmall = WHEEL_MM_PER_PULSE_DEFAULT;
-static uint16_t wheelMmLarge = WHEEL_MM_PER_PULSE_DEFAULT;
-static bool     seedLarge    = false;     // false = small seeds
+static uint16_t wheelMmSmall = DEFAULT_WHEEL_MM_SMALL;
+static uint16_t wheelMmLarge = DEFAULT_WHEEL_MM_LARGE;
+static bool     seedLarge    = DEFAULT_SEED_LARGE;   // false = small seeds
+
+// Screen 20: the settings, and the one way they leave the board - printed over
+// USB. settingsSentMs only drives the "sent" message on the screen.
+static uint8_t  settingsCursor = 0;       // 0 = send, 1 = Wroc
+static uint32_t settingsSentMs = 0;
 
 static uint8_t  seedCursor      = 0;      // screen 16: 0 Male, 1 Duze, 2 Kalibracja, 3 Wroc
 static uint8_t  seedAskIndex    = 0;      // screen 17: 0 = Anuluj, 1 = OK
@@ -177,7 +185,8 @@ static bool seederEverSeen    = false;
 static bool dispenserEverSeen = false;
 
 static FaultCode faultCode = FaultCode::None;
-static uint32_t  linkDownSinceMs = 0;
+static uint32_t  linkDownSinceMs   = 0;
+static uint32_t  turbineBadSinceMs = 0;   // when the fan was first seen stopped
 
 // Clog overlay: the alarm covers any screen. acknowledged means the operator
 // has seen the alarm and moved on to the Anuluj / Odetkaj choice.
@@ -426,6 +435,11 @@ static void handleMenu(ButtonEvent event)
                 screen = Screen::Seeds;
                 seedCursor = 0;       // cursor starts on the first size, never on Wroc
                 break;
+            case MenuItem::Ustawienia:
+                screen = Screen::Settings;
+                settingsCursor = 0;   // cursor starts on the export
+                settingsSentMs = 0;
+                break;
             default:
                 break;
         }
@@ -579,6 +593,57 @@ static void handleSeedCalibResult(ButtonEvent event)
     }
 }
 
+// Everything the tractor keeps in NVS, printed over USB in one block: the
+// operator reads it in a serial monitor at 115200 and keeps it somewhere safe
+// (docs/calibration-settings.txt). The second half is the same values written
+// as the first-boot constants, so restoring a blank board is a paste into
+// include/machine_settings.h and a flash.
+//
+// There is deliberately no way in: no serial command and no packet can write a
+// setting. A calibration costs a drive across the field to measure, and the
+// only thing that may overwrite one is the operator, on the screen that
+// measured it.
+static void exportSettings()
+{
+    Serial.println();
+    Serial.println("=== TRACTOR SETTINGS ===");
+    Serial.printf("  protocol            %u\n",            (unsigned)PROTOCOL_VERSION);
+    Serial.printf("  uptime              %lu s\n",          (unsigned long)(millis() / 1000));
+    Serial.printf("  dose                %u kg/ha\n",       (unsigned)doseKgPerHa);
+    Serial.printf("  dispenser calib     %lu g per 100 rev\n", (unsigned long)gramsPer100Rev);
+    Serial.printf("  dispenser           %s\n",             dispenserEnabled ? "ON" : "OFF");
+    Serial.printf("  tramlines           %s\n",             tramlinesEnabled ? "ON" : "OFF");
+    Serial.printf("  seed size           %s\n",             seedLarge ? "LARGE" : "SMALL");
+    Serial.printf("  wheel mm per pulse  small %u, large %u\n",
+                  (unsigned)wheelMmSmall, (unsigned)wheelMmLarge);
+    Serial.println("  --- paste over the first-boot values in include/machine_settings.h ---");
+    Serial.printf("  static constexpr uint16_t DEFAULT_DOSE_KG_PER_HA    = %u;\n",  (unsigned)doseKgPerHa);
+    Serial.printf("  static constexpr uint32_t DEFAULT_GRAMS_PER_100REV  = %lu;\n", (unsigned long)gramsPer100Rev);
+    Serial.printf("  static constexpr bool     DEFAULT_DISPENSER_ENABLED = %s;\n",  dispenserEnabled ? "true" : "false");
+    Serial.printf("  static constexpr bool     DEFAULT_TRAMLINES_ENABLED = %s;\n",  tramlinesEnabled ? "true" : "false");
+    Serial.printf("  static constexpr bool     DEFAULT_SEED_LARGE        = %s;\n",  seedLarge ? "true" : "false");
+    Serial.printf("  static constexpr uint16_t DEFAULT_WHEEL_MM_SMALL    = %u;\n",  (unsigned)wheelMmSmall);
+    Serial.printf("  static constexpr uint16_t DEFAULT_WHEEL_MM_LARGE    = %u;\n",  (unsigned)wheelMmLarge);
+    Serial.println("=== END, keep this with the date in docs/calibration-settings.txt ===");
+}
+
+// Screen 20: two rows, send and leave. Sending takes about 50 ms of serial
+// writing, which is why it is a screen of its own and not something the work
+// screen can trigger.
+static void handleSettings(ButtonEvent event)
+{
+    if (event == ButtonEvent::Short) {
+        settingsCursor = (settingsCursor + 1) % 2;
+    } else if (event == ButtonEvent::Long) {
+        if (settingsCursor == 0) {
+            exportSettings();
+            settingsSentMs = millis();
+        } else {
+            screen = Screen::Menu;
+        }
+    }
+}
+
 static void handleEdit(ButtonEvent event)
 {
     const uint8_t extraField = digitCount;        // WL./WYL. or TEST
@@ -704,6 +769,7 @@ static void handleView(View view, ButtonEvent event)
         case View::SeedCalibAsk:      handleSeedCalibAsk(event);  break;
         case View::SeedCalibRun:      handleSeedCalibRun(event);  break;
         case View::SeedCalibResult:   handleSeedCalibResult(event); break;
+        case View::Settings:          handleSettings(event);      break;
         case View::CalibConfirm:      handleCalibConfirm(event);  break;
         case View::CalibProgress:
         case View::CalibNoDispenser:  handleCalibTurning(event);  break;
@@ -768,13 +834,23 @@ static void updateFaults(uint32_t now)
         linkDownSinceMs = 0;
     }
 
-    // Highest priority first.
-    if (ENABLE_WOM_ALARM && seederData.wheelTurning && seederData.womRPM < WOM_RUNNING_MIN_RPM) {
-        faultCode = FaultCode::WomOff;
-    } else if (ENABLE_TURBINE_ALARM && seederData.wheelTurning && seederData.turbineRPM < TURBINE_RUNNING_MIN_RPM) {
+    // The fan, but only on telemetry the seeder is actually still sending: once
+    // it goes quiet, the last thing it said is no evidence about the fan (the
+    // same rule the dispenser fault below follows). The condition also has to
+    // hold for TURBINE_ALARM_DELAY_MS, or moving off before the fan is up to
+    // speed would beep every time.
+    bool fanStopped = links.isAlive(NodeId::Seeder) && seederData.wheelTurning &&
+                      seederData.turbineRPM < TURBINE_RUNNING_MIN_RPM;
+    if (fanStopped) {
+        if (turbineBadSinceMs == 0) turbineBadSinceMs = now;
+    } else {
+        turbineBadSinceMs = 0;
+    }
+
+    // Highest priority first: a stopped fan ruins the pass outright, an
+    // over-running dispenser only gets the rate wrong.
+    if (fanStopped && (now - turbineBadSinceMs) >= TURBINE_ALARM_DELAY_MS) {
         faultCode = FaultCode::TurbineOff;
-    } else if (ENABLE_WOM_ALARM && !seederData.wheelTurning && seederData.womRPM >= WOM_RUNNING_MIN_RPM) {
-        faultCode = FaultCode::WomWhileLifted;
     } else if (dispenserEverSeen && links.isAlive(NodeId::Dispenser) &&
                dispenserData.faultCode == DispenserFault::OverSpeed) {
         faultCode = FaultCode::DispenserOverSpeed;
@@ -856,6 +932,7 @@ static View currentView()
         case Screen::SeedCalibAsk:    return View::SeedCalibAsk;
         case Screen::SeedCalibRun:    return View::SeedCalibRun;
         case Screen::SeedCalibResult: return View::SeedCalibResult;
+        case Screen::Settings:        return View::Settings;
         case Screen::CalibConfirm:    return View::CalibConfirm;
         case Screen::CalibRunning:
             if (calibrationInterrupted)            return View::CalibInterrupted;
@@ -1036,28 +1113,91 @@ static void drawSeedCalibResult()
     drawSelectableLine(46, "ZAPISZ", seedResultIndex == 1);
 }
 
-static void drawFaultScreen()
+// Sets the highlight and leaves the cursor where the caller's text goes: the
+// two rows on screen 20 are 12 px, like the editors' action fields, because the
+// four value lines above them need the rest of the panel.
+static void drawSettingsRow(int16_t rowTop, bool selected)
+{
+    if (selected) {
+        oled.fillRect(0, rowTop, SCREEN_WIDTH, 12, WHITE);
+        oled.setTextColor(BLACK);
+    } else {
+        oled.setTextColor(WHITE);
+    }
+    oled.setCursor(2, rowTop + 2);
+}
+
+// Screen 20: everything the board keeps, and the row that sends it over USB.
+// The baud rate is on the row itself, so the operator has it in front of them
+// when they open the serial monitor on the laptop.
+static void drawSettings()
 {
     oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+
+    // Worst case each of these lines is exactly 21 characters, which is the
+    // full width at text size 1.
+    oled.setCursor(0, 0);
+    oled.print("Dawka:");
+    oled.print(doseKgPerHa);
+    oled.print(" Kalib:");
+    oled.print(gramsPer100Rev);
+
+    oled.setCursor(0, 10);
+    oled.print("Doz:");
+    oled.print(dispenserEnabled ? "WL." : "WYL.");
+    oled.print(" Sciezki:");
+    oled.print(tramlinesEnabled ? "WL." : "WYL.");
+
+    oled.setCursor(0, 20);
+    oled.print("Nasiona:");
+    oled.print(seedLarge ? "DUZE" : "MALE");
+
+    oled.setCursor(0, 30);
+    oled.print("Kolo M:");
+    oled.print(wheelMmSmall);
+    oled.print(" D:");
+    oled.print(wheelMmLarge);
+    oled.print("mm");
+
+    bool sent = (settingsSentMs != 0) && (millis() - settingsSentMs < 2000);
+
+    drawSettingsRow(40, settingsCursor == 0);
+    if (sent) {
+        oled.print("Wyslano!");
+    } else {
+        oled.print("Wyslij USB ");
+        oled.print(SERIAL_BAUD);
+    }
+
+    drawSettingsRow(52, settingsCursor == 1);
+    oled.print("Wroc");
+}
+
+// Every full-screen fault is drawn the same way: what has gone wrong on two
+// large lines, on the grid the clog alarm uses, and the way out underneath.
+// They are not acknowledged like the clog alarm - they clear themselves when
+// the machine does - so the only thing to say is how to leave the screen.
+// Two lines because 10 characters is the width at text size 2.
+static void drawFaultLines(const char *what, const char *state)
+{
+    oled.setTextColor(WHITE);
+    oled.setTextSize(2);
+    oled.setCursor(0, 4);
+    oled.print(what);
+    oled.setCursor(0, 22);
+    oled.print(state);
+
+    oled.setTextSize(1);
+    oled.setCursor(0, 54);
+    oled.print("Dlugi klik = menu");
+}
+
+static void drawFaultScreen()
+{
     switch (faultCode) {
-        case FaultCode::WomOff:
-        case FaultCode::WomWhileLifted:
-            oled.setTextSize(3);
-            oled.setCursor(10, 15);
-            oled.print("WOM");
-            break;
-        case FaultCode::TurbineOff:
-            oled.setTextSize(2);
-            oled.setCursor(10, 20);
-            oled.print("Dmuchawa");
-            break;
-        case FaultCode::DispenserOverSpeed:
-            oled.setTextSize(2);
-            oled.setCursor(4, 10);
-            oled.print("DOZOWNIK");
-            oled.setCursor(4, 32);
-            oled.print("ZA SZYBKO");
-            break;
+        case FaultCode::TurbineOff:         drawFaultLines("DMUCHAWA", "STOI");      break;
+        case FaultCode::DispenserOverSpeed: drawFaultLines("DOZOWNIK", "ZA SZYBKO"); break;
         // FaultCode::LinkLost deliberately draws nothing - a lost link is
         // shown as a small letter in the corner of the normal work screen
         // (and on the LEDs), never as a full-screen takeover. It only sounds
@@ -1079,19 +1219,36 @@ static void drawWork()
 {
     oled.setTextColor(WHITE);
 
+    // The two numbers that come from the seeder are only worth reading while it
+    // is still talking. With it unheard they are whatever arrived last, so the
+    // screen says so instead of showing something that looks live.
+    //
+    // Display only: the stored telemetry is left exactly as it was, so a short
+    // gap - which is the usual kind - changes nothing about the alarms, the
+    // relay or what the dispenser is doing with the last speed it had.
+    bool seederStale = seederLinkDown();
+
     oled.setTextSize(2);
     oled.setCursor(0, 0);
     oled.print("RPM ");
-    oled.print(seederData.turbineRPM);
+    if (seederStale) {
+        oled.print("???");
+    } else {
+        oled.print(seederData.turbineRPM);
+    }
 
-    // mm/s -> km/h with one decimal: mm/s * 3.6 / 1000
-    uint32_t kmhTenths = ((uint32_t)seederData.groundSpeedMmS * 36UL) / 1000UL;
     oled.setTextSize(1);
     oled.setCursor(0, 20);
-    oled.print(kmhTenths / 10);
-    oled.print('.');
-    oled.print(kmhTenths % 10);
-    oled.print("km/h");
+    if (seederStale) {
+        oled.print("???km/h");      // as wide as "6.4km/h", so nothing else moves
+    } else {
+        // mm/s -> km/h with one decimal: mm/s * 3.6 / 1000
+        uint32_t kmhTenths = ((uint32_t)seederData.groundSpeedMmS * 36UL) / 1000UL;
+        oled.print(kmhTenths / 10);
+        oled.print('.');
+        oled.print(kmhTenths % 10);
+        oled.print("km/h");
+    }
 
     // Which seed-size gear the dose is being metered for. One letter, because
     // the line is full at two digits of speed - but it has to be somewhere: the
@@ -1099,11 +1256,13 @@ static void drawWork()
     oled.setCursor(54, 20);
     oled.print(seedLarge ? 'D' : 'M');
 
-    oled.setCursor(66, 20);
-    if (!dispenserEnabled || doseKgPerHa == 0) {
-        oled.print("DOZ:WYL.");
-    } else {
-        oled.print("DOZ:");
+    // The dose, and only when the dispenser is actually set to apply one: a
+    // number here means it is on, and nothing here means it is off. Worst case
+    // "kg/ha: 999" ends on the last pixel column.
+    bool dosing = dispenserEnabled && doseKgPerHa > 0;
+    if (dosing) {
+        oled.setCursor(66, 20);
+        oled.print("kg/ha: ");
         oled.print(doseKgPerHa);
     }
 
@@ -1119,14 +1278,31 @@ static void drawWork()
         oled.print("Sciezki: WYL.");
     }
 
-    // Only shown when something is wrong - a clean screen means all good.
+    // The bottom row says one of two things, and an empty row means all is
+    // well and the dispenser is off. A board that has gone missing comes first:
+    // it matters more than the rate, and with the seeder or the dispenser gone
+    // the rate under it would be stale anyway.
+    oled.setTextSize(1);
+    oled.setCursor(0, 50);
+
     if (anyLinkDown()) {
-        oled.setTextSize(1);
-        oled.setCursor(0, 50);
         oled.print("BRAK:");
         if (seederLinkDown())     oled.print(" S");
         if (dispenserLinkDown())  oled.print(" D");
         if (crossLinkDown())      oled.print(" S-D");
+    } else if (dosing && dispenserEverSeen) {
+        oled.print("Doz:");
+        oled.print(dispenserData.measuredShaftRPM);
+        oled.print(" RPM");
+
+        // Four frames, half a second each, and only while the auger is really
+        // being driven: a machine standing still, or a dispenser with nothing
+        // to do, leaves this blank rather than pretending to work.
+        if (dispenserData.motorRunning) {
+            static const char *const FRAMES[4] = {"[*   ]", "[ *  ]", "[  * ]", "[   *]"};
+            oled.setCursor(92, 50);
+            oled.print(FRAMES[(millis() / 500) % 4]);
+        }
     }
 }
 
@@ -1377,6 +1553,7 @@ static void redraw()
         case View::SeedCalibAsk:      drawSeedCalibAsk();     break;
         case View::SeedCalibRun:      drawSeedCalibRun();     break;
         case View::SeedCalibResult:   drawSeedCalibResult();  break;
+        case View::Settings:          drawSettings();         break;
         case View::CalibConfirm:      drawCalibConfirm();     break;
         case View::CalibProgress:     drawCalibProgress();    break;
         case View::CalibDone:         drawCalibDone();        break;
@@ -1394,7 +1571,7 @@ static void redraw()
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(SERIAL_BAUD);
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(GREEN_LED_PIN, OUTPUT);
@@ -1406,13 +1583,16 @@ void setup()
     prefs.begin("tractor", false);
     // Stored in the ESP32's NVS partition in flash - no battery involved, so
     // these survive being unplugged indefinitely (see CLAUDE.md).
-    doseKgPerHa      = prefs.getUShort("dose",  DEFAULT_DOSE_KG_PER_HA);
-    gramsPer100Rev   = prefs.getULong("calib",  DEFAULT_GRAMS_PER_100REV);
-    dispenserEnabled = prefs.getBool("disp_on", false);
-    tramlinesEnabled = prefs.getBool("tram_on", false);   // no saved value = off
-    wheelMmSmall     = prefs.getUShort("wheel_s", WHEEL_MM_PER_PULSE_DEFAULT);
-    wheelMmLarge     = prefs.getUShort("wheel_l", WHEEL_MM_PER_PULSE_DEFAULT);
-    seedLarge        = prefs.getBool("seed_l", false);    // no saved value = small seeds
+    // No saved value means a new board or an erased one: it starts from the
+    // first-boot constants, which are also the restore path - see the Ustawienia
+    // screen and docs/calibration-settings.txt.
+    doseKgPerHa      = prefs.getUShort("dose",    DEFAULT_DOSE_KG_PER_HA);
+    gramsPer100Rev   = prefs.getULong("calib",    DEFAULT_GRAMS_PER_100REV);
+    dispenserEnabled = prefs.getBool("disp_on",   DEFAULT_DISPENSER_ENABLED);
+    tramlinesEnabled = prefs.getBool("tram_on",   DEFAULT_TRAMLINES_ENABLED);
+    wheelMmSmall     = prefs.getUShort("wheel_s", DEFAULT_WHEEL_MM_SMALL);
+    wheelMmLarge     = prefs.getUShort("wheel_l", DEFAULT_WHEEL_MM_LARGE);
+    seedLarge        = prefs.getBool("seed_l",    DEFAULT_SEED_LARGE);
 
     oled.begin(SH1106_SWITCHCAPVCC, OLED_I2C_ADDRESS);
     // oled.begin() calls Wire.begin(), which leaves the bus at the Arduino
@@ -1514,7 +1694,8 @@ void loop()
     View liveView = currentView();
     bool live = (liveView == View::Work || liveView == View::WorkFault ||
                  liveView == View::CalibProgress || liveView == View::Unclogging ||
-                 liveView == View::SeedCalibRun);
+                 liveView == View::SeedCalibRun ||
+                 liveView == View::Settings);   // so the "sent" message clears itself
 
     if (displayDirty || (live && (now - lastDisplayMs >= DISPLAY_INTERVAL_MS))) {
         lastDisplayMs = now;

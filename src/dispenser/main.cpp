@@ -83,7 +83,7 @@ void setup()
     // what hold the driver off during reset and boot.
     motorBegin();
 
-    Serial.begin(115200);
+    Serial.begin(SERIAL_BAUD);
     encoderBegin();
 
     WiFi.mode(WIFI_STA);

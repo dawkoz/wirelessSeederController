@@ -1,0 +1,72 @@
+CALIBRATION AND SETTINGS - TRACTOR MODULE
+=========================================
+
+WHAT THIS FILE IS
+    A record of what the tractor board keeps in its NVS. Nothing reads it
+    automatically - it is your copy, for the day a board dies or its flash is
+    erased. Paste a new block in at the bottom whenever a calibration changes,
+    with the date.
+
+HOW TO EXPORT
+    1. Plug the tractor board into the laptop with a USB cable.
+    2. Open the serial monitor at 115200 baud:
+           pio device monitor -e tractor
+       (VS Code: the PlatformIO sidebar, tractor -> Monitor.)
+    3. On the tractor: MENU -> Ustawienia -> long press on "Wyslij USB 115200".
+       The screen says "Wyslano!" when it has sent.
+    4. Copy the whole block out of the monitor and paste it below, with the date.
+
+HOW TO RESTORE
+    A normal upload KEEPS these values - the program and NVS live in different
+    partitions of the flash, so `pio run -e tractor -t upload` does not touch
+    them. You only need this file after:
+        - `pio run -t erase`, or a change to the partition table, or
+        - fitting a different ESP32 board.
+    Then take the "static constexpr" half of the newest block below, paste it
+    over the first-boot values in include/machine_settings.h, and flash the
+    tractor. A board with an empty NVS starts from exactly those numbers. Once
+    it has run once, NVS wins again and machine_settings.h no longer matters.
+
+    There is no way to write settings into the tractor over the radio or the
+    serial line, on purpose: a calibration costs a drive across the field, and
+    the only thing that may overwrite one is the operator, on the screen that
+    measured it.
+
+WHAT THE VALUES ARE
+    dose                the Dawka screen, kg/ha
+    dispenser calib     the Kalibracja screen, grams per 100 dispenser turns
+    dispenser           the Wl./Wyl. field on the Dawka screen
+    tramlines           the Sciezki switch
+    seed size           the Nasiona screen - which gear the machine is in
+    wheel mm per pulse  measured by Nasiona -> Kalibracja, one value per gear
+
+    Everything else (motor constants, timings, pin numbers) is compile-time and
+    already kept in git.
+
+RECORDS - newest at the bottom
+==============================
+
+--- EXAMPLE, these are the untouched first-boot values. Delete when you paste
+--- a real one. Date every block: the wheel values only mean anything for the
+--- machine, wheel and magnets they were measured on.
+
+2026-09-18  factory defaults, nothing measured yet
+
+=== TRACTOR SETTINGS ===
+  protocol            5
+  uptime              12 s
+  dose                40 kg/ha
+  dispenser calib     500 g per 100 rev
+  dispenser           OFF
+  tramlines           OFF
+  seed size           SMALL
+  wheel mm per pulse  small 785, large 785
+  --- paste over the first-boot values in include/machine_settings.h ---
+  static constexpr uint16_t DEFAULT_DOSE_KG_PER_HA    = 40;
+  static constexpr uint32_t DEFAULT_GRAMS_PER_100REV  = 500;
+  static constexpr bool     DEFAULT_DISPENSER_ENABLED = false;
+  static constexpr bool     DEFAULT_TRAMLINES_ENABLED = false;
+  static constexpr bool     DEFAULT_SEED_LARGE        = false;
+  static constexpr uint16_t DEFAULT_WHEEL_MM_SMALL    = 785;
+  static constexpr uint16_t DEFAULT_WHEEL_MM_LARGE    = 785;
+=== END, keep this with the date in docs/calibration-settings.txt ===

@@ -61,6 +61,7 @@ src/dispenser/dispenser_logic.h   the dispenser's decision logic, header-only an
 src/dispenser/dispenser_io.h/.cpp encoder, motor output and the packet inbox - the only dispenser code that touches pins
 src/dispenser_bench/        bench test image for the dispenser module - its own environment, never fitted (see docs/dispenser_module_hardware.md)
 docs/dispenser_module_hardware.md   dispenser parts list, pin verification, wiring, bench test
+docs/calibration-settings.txt       what the tractor has stored, exported over USB - the backup for an erased or replaced board
 ```
 
 Why one project with multiple envs, instead of three separate PlatformIO projects: it lets `include/espnow_protocol.h` be physically the same file for every board that needs it, so the protocol can't silently drift between boards the way it could with copy-pasted struct definitions (which is how this repo worked before the PlatformIO migration — each `.ino` had its own copy).
@@ -149,7 +150,7 @@ What the tractor's OLED shows and what the button does on each screen, as built 
 Power on: Adafruit logo while starting up, 0.5 s beep
 └── 1 MENU
     ├── Praca ────── 2 WORK
-    │                └── 3 FAULT, replaces WORK while active
+    │                └── 3a / 3b FAULTS, replace WORK while active
     ├── Dawka ────── 4 DOSE EDITOR
     ├── Kalibracja ─ 5 CALIBRATION EDITOR
     │                └── TEST ─ 6 CONFIRM
@@ -159,12 +160,13 @@ Power on: Adafruit logo while starting up, 0.5 s beep
     │                                       ├── 10 NO DISPENSER
     │                                       └── 11 INTERRUPTED
     ├── Sciezki ──── 15 TRAMLINES
-    └── Nasiona ──── 16 SEEDS (size, and the wheel calibration for it)
-                     └── Kalibracja ─ 17 CONFIRM
-                                      └── OK ─ 18 DRIVING
-                                               └── 19 RESULT
+    ├── Nasiona ──── 16 SEEDS (size, and the wheel calibration for it)
+    │                └── Kalibracja ─ 17 CONFIRM
+    │                                 └── OK ─ 18 DRIVING
+    │                                          └── 19 RESULT
+    └── Ustawienia ─ 20 SETTINGS, and the USB export
 
-The menu has five items and four rows: the window follows the cursor, and
+The menu has six items and four rows: the window follows the cursor, and
 wrapping past the last item brings it back to the top.
 
 Over any screen while the dispenser reports a clog:
@@ -177,14 +179,14 @@ Screens 7–11 are one screen. Its content changes by itself as the dispenser re
 ### Mockups
 
 ```
-┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
-│[Praca              ]│  │RPM 3150             │  │                     │
-│ Dawka               │  │6.4km/h  M DOZ:40    │  │ DOZOWNIK            │
-│ Kalibracja          │  │                     │  │                     │
-│ Sciezki             │  │Przejazd:       3    │  │ ZA SZYBKO           │
-│                     │  │BRAK: D              │  │                     │
-└─────────────────────┘  └─────────────────────┘  └─────────────────────┘
-        1. Menu                  2. Work                  3. Fault
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│[Praca              ]│  │RPM 3150             │  │DMUCHAWA             │  │DOZOWNIK             │
+│ Dawka               │  │6.4km/h  M kg/ha: 40 │  │                     │  │                     │
+│ Kalibracja          │  │                     │  │STOI                 │  │ZA SZYBKO            │
+│ Sciezki             │  │Przejazd:       3    │  │                     │  │                     │
+│                     │  │Doz:42 RPM     [*   ]│  │Dlugi klik = menu    │  │Dlugi klik = menu    │
+└─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
+        1. Menu                  2. Work              3a. Blower stopped       3b. Dispenser too fast
 
 ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
 │DAWKA kg/ha     WYBOR│  │KALIBR. g/100   WYBOR│  │Start kalibracji?    │
@@ -222,14 +224,14 @@ Screens 7–11 are one screen. Its content changes by itself as the dispenser re
 └─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
    11. Interrupted          12. Clog alarm           13. Clog choice          14. Unclogging
 
-┌─────────────────────┐  ┌─────────────────────┐
-│SCIEZKI              │  │RPM 3150             │
-│                     │  │6.4km/h  M DOZ:40    │
-│       [WYL.]        │  │                     │
-│                     │  │Sciezki: WYL.        │
-│            ZAPISZ   │  │BRAK: D              │
-└─────────────────────┘  └─────────────────────┘
-     15. Tramlines         2. Work, tramlines off
+┌─────────────────────┐
+│SCIEZKI              │
+│                     │
+│       [WYL.]        │
+│                     │
+│            ZAPISZ   │
+└─────────────────────┘
+     15. Tramlines
 
 ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
 │[Male nas.        ]■ │  │Kalibracja kola      │  │Przejedz 100 m       │  │Wynik: 128 imp       │
@@ -239,6 +241,25 @@ Screens 7–11 are one screen. Its content changes by itself as the dispenser re
 │                     │  │ OK                  │  │Dlugi klik = koniec  │  │ ZAPISZ              │
 └─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
      16. Nasiona            17. Calibrate?            18. Driving              19. Result
+
+┌─────────────────────┐
+│Dawka:40 Kalib:500   │
+│Doz:WL. Sciezki:WYL. │
+│Nasiona:MALE         │
+│Kolo M:781 D:627mm   │
+│[Wyslij USB 115200  ]│
+│ Wroc                │
+└─────────────────────┘
+     20. Settings
+
+┌─────────────────────┐
+│Kalibracja kola      │
+│Za malo impulsow     │
+│                     │
+│[Anuluj             ]│
+│                     │
+└─────────────────────┘
+    19b. Failed run
 ```
 
 On 16 the inverted row is the cursor and the small square marks the size in
@@ -248,13 +269,42 @@ nothing usable: `Brak siewnika`, `Reset siewnika` (its cumulative counter
 restarted, so the difference means nothing), `Za malo impulsow` (under
 `WHEEL_CALIB_MIN_PULSES`) or `Wynik poza zakresem`.
 
+#### The work screen in every state
+
+```
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│RPM 3150             │  │RPM 3150             │  │RPM 3150             │  │RPM 3150             │
+│6.4km/h  M kg/ha: 40 │  │0.0km/h  M kg/ha: 40 │  │6.4km/h  M           │  │6.4km/h  M kg/ha: 40 │
+│                     │  │                     │  │                     │  │                     │
+│Przejazd:       3    │  │Przejazd:       3    │  │Przejazd:       3    │  │Sciezki: WYL.        │
+│Doz:42 RPM     [*   ]│  │Doz:0 RPM            │  │                     │  │Doz:42 RPM     [ *  ]│
+└─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
+   a. dispensing            b. standing still        c. dispenser off         d. tramlines off
+
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│RPM 3150             │  │RPM ???              │  │RPM 3150             │  │RPM 3150             │
+│6.4km/h  M kg/ha: 40 │  │???km/h  M kg/ha: 40 │  │6.4km/h  M kg/ha: 40 │  │12.4km/h D kg/ha: 999│
+│                     │  │                     │  │                     │  │                     │
+│Przejazd:       3    │  │Przejazd:       3    │  │Przejazd:       3    │  │Przejazd:       6    │
+│BRAK: D              │  │BRAK: S              │  │BRAK: S-D            │  │Doz:330 RPM    [   *]│
+└─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
+   e. dispenser unheard     f. seeder unheard        g. deaf to each other     h. widest case
+```
+
+- **Top line:** the turbine's RPM, as the seeder last reported it.
+- **Second line:** ground speed; `M` or `D` for the seed-size gear; and the dose, drawn **only while the dispenser is switched on** — a blank there means off, so there is never a number to misread (b shows the machine stopped with the dispenser still on, c shows it switched off). Case h is the widest the line can get and it exactly fills the display.
+- **Third line:** `Przejazd:` and the pass number in large digits, or `Sciezki: WYL.` when tramlines are off, because the pass number would then mean nothing.
+- **Bottom line:** `BRAK:` and the letters of whatever is missing, if anything is (e, f, g). Otherwise the dispenser's measured shaft RPM, and the four-frame animation while the auger is actually being driven — half a second a frame, blank when the machine stands still or the dispenser has nothing to do. An empty line means all is well and the dispenser is off.
+- **The seeder's two numbers go to `???` while it is unheard** (f). What is stored is the last packet it sent, and a frozen number looks live. Only the drawing changes: the telemetry itself is left alone, so a gap of a second or two — which is the usual kind — disturbs neither the alarms, nor the tramline relay, nor the dispenser, which keeps metering on the last speed it had. `???km/h` is exactly as wide as a real speed, so nothing else on the line moves.
+
 ### What each screen does
 
 | Screen               | Content                                                                                                                                                                                                                                                                                                                                                               | Short press                                                      | Long press                                                |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------- |
-| 1 Menu               | `Praca`, `Dawka`, `Kalibracja`, `Sciezki`, `Nasiona` — four rows at a time, the window following the cursor. Starts on `Praca`, then stays on the item last opened                                                                                                                                                                                                                                                                      | next item                                                        | open it                                                   |
-| 2 Work               | turbine RPM, ground speed, the seed size in use (`M` or `D`), dispenser setting (`DOZ:WYL.` or the dose), pass number 1–6 in large digits. While tramlines are off, `Sciezki: WYL.` sits where `Przejazd:` and the pass number were. The `BRAK:` line appears only while a link is down: `S` seeder, `D` dispenser (only after it has been heard once), `S-D` seeder and dispenser can't hear each other | next pass, 6 → 1 (nothing while tramlines are off)               | back to 1                                                 |
-| 3 Fault              | `DOZOWNIK ZA SZYBKO` (driving faster than the dispenser can keep up with; only while the dispenser is heard — a silent dispenser is announced by `BRAK: D` instead)                                                                                                                                                                                                   | nothing (the pass number is hidden, so it must not change blind) | back to 1                                                 |
+| 1 Menu               | `Praca`, `Dawka`, `Kalibracja`, `Sciezki`, `Nasiona`, `Ustawienia` — four rows at a time, the window following the cursor. Starts on `Praca`, then stays on the item last opened                                                                                                                                                                                                                                                                      | next item                                                        | open it                                                   |
+| 2 Work               | turbine RPM, ground speed, the seed-size gear (`M` or `D`) and the dose in `kg/ha` — the dose is drawn only while the dispenser is switched on, so a blank there means it is off. Pass number 1–6 in large digits; while tramlines are off, `Sciezki: WYL.` takes that place. The bottom row is `BRAK:` while a link is down (`S` seeder, `D` dispenser once it has been heard, `S-D` they cannot hear each other), otherwise the dispenser's measured shaft RPM (`Doz:42 RPM`) and a four-frame animation that runs only while the auger is actually being driven. An empty bottom row means all is well and the dispenser is off. While the seeder is unheard the turbine RPM and the speed are drawn as `???`, the stored values untouched | next pass, 6 → 1 (nothing while tramlines are off)               | back to 1                                                 |
+| 3a Blower            | `DMUCHAWA STOI` — the machine is moving and the seeder reports the turbine below `TURBINE_RUNNING_MIN_RPM`, held for `TURBINE_ALARM_DELAY_MS` so that moving off before the fan is up to speed does not beep. Only on telemetry still arriving: a silent seeder is `BRAK: S`, not a fan fault |                                                    nothing (the pass number is hidden, so it must not change blind) | back to 1                                                 |
+| 3b Dispenser         | `DOZOWNIK ZA SZYBKO` (driving faster than the dispenser can keep up with; only while the dispenser is heard — a silent dispenser is announced by `BRAK: D` instead)                                                                                                                                                                                                   | nothing (the pass number is hidden, so it must not change blind) | back to 1                                                 |
 | 4 Dose editor        | dose in kg/ha, `WL./WYL.`, `ZAPISZ`                                                                                                                                                                                                                                                                                                                                   | see Editors                                                      | see Editors                                               |
 | 5 Calibration editor | grams per 100 dispenser revolutions, `TEST`, `ZAPISZ`                                                                                                                                                                                                                                                                                                                 | see Editors                                                      | see Editors                                               |
 | 6 Confirm            | `Anuluj` (preselected) or `START`                                                                                                                                                                                                                                                                                                                                     | switch                                                           | `Anuluj` → 5, `START` → 7                                 |
@@ -270,6 +320,7 @@ restarted, so the difference means nothing), `Za malo impulsow` (under
 | 16 Nasiona | `Male nas.` / `Duze nas.` (a square marks the one in use) / `Kalibracja` / `Wroc` | next row | a size: select and store it at once; `Kalibracja` → 17; `Wroc` → 1 |
 | 17 Calibrate? | `Kalibracja kola` and which size, `Anuluj` (preselected) / `OK` | switch | `Anuluj` → 16; `OK` → 18, or → 19 with `Brak siewnika` if the seeder is not heard |
 | 18 Driving | the pulses counted since START, in large digits. No distance: it could only be shown using the value being replaced, and the 100 m is measured on the ground. Can be driven during normal work — it only reads the seeder's cumulative counter | ignored, so a stray press cannot throw away a 100 m drive | finish → 19 |
+| 20 Ustawienia | everything the board keeps in NVS, and two rows: send it over USB (the baud rate is on the row) or leave. The only way settings leave the board — nothing can write them back in, see docs/calibration-settings.txt | switch | send, printing the block and showing `Wyslano!`; `Wroc` → 1 |
 | 19 Result | the measured mm per pulse against the one it would replace, or why the run gave nothing | switch (nothing to switch on a failure) | `Anuluj` → 16; `ZAPISZ` stores it for the size being calibrated → 16 |
 
 ### Editors (4 and 5)
@@ -286,7 +337,7 @@ restarted, so the difference means nothing), `Za malo impulsow` (under
 
 - **Buzzer:** beeps ¼ s on, ¼ s off while a dispenser fault is active, including on screens that don't show the fault, and while the clog alarm (12) shows — also on screens that don't show it. It also beeps, with nothing on screen, when a board that was heard has been silent for about 6 s, or when the seeder and dispenser haven't heard each other for about 6 s.
 - **LEDs:** green = all links fine. Blue blinking = a link is down, including the seeder not heard since power-on. Yellow = the seeder's last report says the tramline relay is on.
-- Coded but switched off: the `WOM` and `Dmuchawa` fault screens (`ENABLE_WOM_ALARM` and `ENABLE_TURBINE_ALARM` are `false`).
+- **Two faults can take over the work screen**, both always on: the blower (3a) and the dispenser over-speed (3b). Nothing is acknowledged - they clear themselves when the machine does, and until then the buzzer runs and a long press is the only thing that works. A lost link is not one of them: it is the `BRAK:` letters, the blue LED and, after `LINK_BUZZER_DELAY_MS`, the buzzer. There was a WOM alarm; it was removed on 18 September 2026 because no WOM sensor exists.
 
 ## Dispenser behaviour
 
@@ -347,14 +398,14 @@ The rules below apply to every new task written into this section.
 - **Hardware verification before field use.** Nothing has run on the machine yet.
   - Dispenser module on the bench: **the bench test image ran on 17 September 2026** ([docs/dispenser_module_hardware.md](docs/dispenser_module_hardware.md) §6). Supply, driver, motor, both encoder channels, direction, radio, metering, link loss and the calibration run passed. **Not run yet:** the K tests (clog and unclogging with the motor; only K07 needs the lever) and the stall tests H06 and K07 (no fuse on the bench). The W, L and M11 checks added on 18 September 2026 have never run on the board either - they need no hardware beyond the module itself (`w` and `d`), so run them with the next bench session. That run's four failures were bugs in the tests, fixed afterwards: D08 and D20 expected the calibration target on the step that enters Calibrating, which resets the controller; C04 counted the shaft coasting down from metering; and `benchPrepare()` started the logic before its 1 s wait, so the first control step of every motor test integrated a whole second of error — M02 measured 215 RPM for a 192 RPM target (a simulation of the controller reproduces 214).
   - All three boards on a desk: pull power from each in turn — the seeder holds its relay, the dispenser stops when the seeder goes, the right `BRAK:` letters appear. With a fault beeping, cut the seeder's power: the buzzer must stop (regression check for the old stuck-buzzer bug).
-  - **Fit the 6 magnets and calibrate both gears.** `Nasiona` → `Kalibracja` on the tractor, once in each seed-size gear, driving `WHEEL_CALIB_DISTANCE_M` in the field with the machine working so that wheel slip is part of the number. Until then every board meters on `WHEEL_MM_PER_PULSE_DEFAULT` (785 mm), which is an estimate. Check the counts differ between the gears by roughly the ratio you measured, and that the seed-rate setting really does not change them. Then set `WHEEL_MM_PER_PULSE_DEFAULT` to the measured value for the gear used most and reflash: it is the fallback before the first command arrives, and `WHEEL_MIN_PULSE_GAP_US` - the interrupt's noise filter, which has to be a compile-time constant - is derived from it. At 785 mm it ignores pulses closer together than ~40 km/h; a measured value much below 400 mm would make that filter start clipping real pulses at working speed.
+  - **Fit the 6 magnets and calibrate both gears.** `Nasiona` → `Kalibracja` on the tractor, once in each seed-size gear, driving `WHEEL_CALIB_DISTANCE_M` in the field with the machine working so that wheel slip is part of the number. Until then every board meters on `WHEEL_MM_PER_PULSE_DEFAULT` (785 mm), which is an estimate. Check the counts differ between the gears by roughly the ratio you measured, and that the seed-rate setting really does not change them. Export the result afterwards (`Ustawienia` → `Wyslij`) and keep the block in [docs/calibration-settings.txt](docs/calibration-settings.txt). Then set `WHEEL_MM_PER_PULSE_DEFAULT` to the measured value for the gear used most and reflash: it is the fallback before the first command arrives, and `WHEEL_MIN_PULSE_GAP_US` - the interrupt's noise filter, which has to be a compile-time constant - is derived from it. At 785 mm it ignores pulses closer together than ~40 km/h; a measured value much below 400 mm would make that filter start clipping real pulses at working speed.
   - Dispenser calibration: check `ENCODER_EDGES_PER_REV` by hand-turning 10 revolutions (≈ 4800 edges), then `Kalibracja` → `TEST`, catch and weigh the output, enter it.
   - Blockage: stall the running dispenser; the tractor must alarm.
 - **Auger output per revolution** — mechanical, not firmware: 40 kg/ha at 10 km/h needs roughly ≥ 800 g per 100 revolutions (Design record → Dispenser). Firmware clamps and alarms either way.
 - **Statistics screen** — agreed with the user, not designed in detail: hectares, kg applied, average kg/ha, wheel pulses, dispenser revolutions, and `ZERUJ` with a confirmation. The main menu is now full (four rows at text size 2), so a fifth item needs scrolling. The encoder counts reverse turns too, so leave `Unclogging` out of the revolution total.
 - **Task watchdog on the three production boards — do this before field use, dispenser first.** Planned in the fail-safe design, never added. Without it, a hung `loop()` on the dispenser leaves the motor PWM at its last duty until the power is cut; a crash or brownout is already safe (the reset runs `motorBegin()`). Arduino-ESP32 2.0.17 has it built in: call `enableLoopWDT()` as the last line of `setup()` in `src/dispenser`, `src/tractor` and `src/seeder` (5 s timeout, the core feeds it after every `loop()`). All three loops return within milliseconds; the logic already treats a reboot safely (motor off, counters resync, calibration not re-armed). **Not in the bench image** — its operator prompts block inside a test for minutes.
 - **README is out of date** — it still says to write MAC addresses into the source and describes two boards.
-- **Real WOM (power take-off) RPM sensing** — hardcoded to `540` in `src/seeder/main.cpp` (`telemetry.womRPM = 540`). The WOM alarms in `updateFaults()` stay dead code (`ENABLE_WOM_ALARM` is `false`) until a real sensor exists.
+- **WOM (power take-off) RPM is fabricated** — `src/seeder/main.cpp` sends a fixed `540` and nothing reads it. The alarm that used to (and could only ever have fired on a machine standing still, given the fixed value) was removed on 18 September 2026, with the WOM constants. If a sensor is ever fitted the field is still there on the wire; if not, it can go at the next protocol bump.
 - **Wiring diagram** and **demonstration video** — README TODOs.
 - **Motor constants from the machine — the one tweak that matters for dose accuracy.** The bench run confirmed `ENCODER_EDGES_PER_REV` = 480 (481 by hand; the calibration run stopped at 100.2 revolutions) and `MOTOR_DIR_FORWARD` = `LOW`. It measured only a free shaft on the bench supply: 347 RPM at full duty against `MOTOR_MAX_RPM` = 330, breakaway at 70 permille against `MOTOR_MIN_RUNNING_PERMILLE` = 80.
   - Why `MOTOR_MAX_RPM` matters: the feed-forward assumes the motor reaches it at full duty, and the integral resets whenever metering stops (headland, lifting), so every start runs on the feed-forward alone. Simulated with a motor 15 % faster than assumed (a tractor at ~14 V), a 192 RPM target runs at ~221 RPM for the first 2 s, 210 after 4 s, 197 after 16 s; with `MOTOR_MAX_RPM` equal to the real speed, 193 from the start. It is also the `ZA SZYBKO` limit, so it must be a speed the **loaded** motor really reaches.
@@ -381,6 +432,7 @@ Everything below is written and builds with `pio run` (four environments, zero e
 - **Review fixes** — the bench abort became sticky and ends the whole command; test deadlines are timed from the packet that carries the change; D29 and M06 corrected (D29 couldn't fail, M06 couldn't pass) and D35 added; K07 no longer restarts the motor after the lever comes off; the dispenser's PI integral is clamped to `−feedForward`, so a negative integral left from a higher target can't hold the motor off after slowing down; the tractor shows `ZA SZYBKO` only while the dispenser is heard.
 - **Protocol v5 + distance per pulse as a setting** — the wheel sensor turned out to be on the metering drive, whose ratio to the ground wheel depends on the machine's seed-size gear, so `WHEEL_MM_PER_PULSE` could not be a constant: `TractorCommand` now carries `wheelMmPerPulse` and the seeder meters with what it is sent. The fixed 2 s stop timeout became a speed (`WHEEL_MIN_SPEED_MM_S`), so a slow pulse rate can no longer read as "stopped", and the noise gate is derived from a top speed instead of being a literal. 11 bench checks (W01–W11) drive `wheel_speed.h` with simulated pulse trains.
 - **Seed-size screen and wheel calibration** — a fifth menu item `Nasiona` (so the menu scrolls), the size stored on the tractor and shown on the work screen, and a wizard that measures the distance per pulse by driving 100 m (screens 16–19). It refuses a run that a seeder reboot or too few pulses made meaningless, and a radio gap during the drive costs nothing, because the counter it reads is cumulative.
+- **Settings export** — an `Ustawienia` screen (screen 20) listing everything the tractor keeps in NVS, with one row that prints it over USB at `SERIAL_BAUD` and confirms with `Wyslano!`. The printout doubles as the first-boot constants, so an erased or replaced board is restored by pasting into `include/machine_settings.h`. Export only: nothing can write a setting into the board.
 - **Distance ledger** — the dispenser meters to the ground rather than to the speed estimate: a debt in shaft revolutions, paid off over `LEDGER_CATCHUP_SECONDS`, with the ground interpolated between pulses. 12 logic checks (L01–L12) and a motor-in-the-loop check (M11) that compares shaft turns against simulated ground; D03, D06, D29, D33 and D35 were re-expressed against the commanded target, which now includes the ledger's trim.
 
 ### Design record
@@ -443,7 +495,7 @@ Governing principle, agreed with the user: **a gap in the field is a permanent d
 
 - One existing button and no hardware change; a phone/SoftAP configuration mode was rejected (see below).
 - A long press fires at 1.5 s while still held, confirmed by a short beep, so it works with gloves and without looking; the release is swallowed. A screen changes only on a press or because another board reported something — there are no idle timeouts.
-- Dose, calibration and dispenser on/off are stored with `Preferences` in the NVS partition of the ESP32's flash: no battery; retention in the order of 10–20 years; ~100,000 erase cycles per sector with wear levelling, written only on an operator action. Only a full-chip erase or a partition-table change clears them — a normal upload keeps them.
+- Dose, calibration and dispenser on/off are stored with `Preferences` in the NVS partition of the ESP32's flash: no battery; retention in the order of 10–20 years; ~100,000 erase cycles per sector with wear levelling, written only on an operator action. Only a full-chip erase or a partition-table change clears them — a normal upload keeps them. The `Ustawienia` screen prints everything stored over USB, both in words and as the first-boot constants, so restoring an erased or replaced board is a paste into `machine_settings.h` and a flash ([docs/calibration-settings.txt](docs/calibration-settings.txt)). That printout is the only way settings leave a board, and there is deliberately no way in: no packet and no serial command can write a setting, because a calibration costs a drive across the field and only the operator, on the screen that measured it, may replace one.
 - Values that never change in service (working width, tramline rhythm) stay compile-time constants. The distance per wheel pulse used to be one and is not any more: the machine's seed-size gear changes it, so it is a measured setting per gear, stored on the tractor and sent on the wire like the dose. The tractor broadcasts dose and calibration in every packet, so the dispenser stores nothing and never needs reflashing when they change.
 - Calibration run: the request is level-triggered (survives lost packets without an acknowledgement protocol); it bypasses the ground-speed interlock because it's a stationary job and the seeder may be off, but is refused while the machine moves; tractor loss aborts it; a short press can't stop it (that would spoil the weighing). The dispenser starts a run only on a request it saw go from 0 to 1, so it never restarts one by itself after its own reboot, a link gap or a clog — the tractor shows `PRZERWANA` instead of sitting at 0 %.
 - Clog alarm (agreed with the user): clog = shaft under 1/3 of the commanded speed for 1.5 s; the alarm covers any screen with the buzzer; `OK` → `Anuluj` (preselected, resumes metering) / `Odetkaj` (4 s reverse/forward sequence, no success check). Commands are counters repeated in every packet, acted on once, ignored right after a link gap or tractor reboot. A press counts only if its screen was already showing for the whole press, so an alarm appearing mid-press can't be acknowledged blind.

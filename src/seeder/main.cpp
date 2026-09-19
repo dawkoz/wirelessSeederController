@@ -163,7 +163,7 @@ static void sendTelemetry(uint32_t nowMs)
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(SERIAL_BAUD);
 
     // Relay off before anything else, so a reset can never leave it energised.
     pinMode(RELAY_PIN, OUTPUT);

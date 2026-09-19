@@ -21,6 +21,13 @@
 static constexpr uint32_t WORKING_WIDTH_CM        = 400;   // 4.00 m
 static constexpr uint16_t CALIBRATION_REVOLUTIONS = 100;   // dispenser shaft turns per calibration run
 
+// --- Serial -----------------------------------------------------------------
+
+// Serial monitor speed on every board, and what the tractor's Ustawienia screen
+// tells the operator to set on the laptop. Keep it equal to `monitor_speed` in
+// platformio.ini.
+static constexpr uint32_t SERIAL_BAUD = 115200;
+
 // --- Radio link -------------------------------------------------------------
 
 static constexpr uint8_t  NETWORK_ID       = 1;      // change only if a machine nearby runs this firmware
@@ -113,10 +120,18 @@ static constexpr uint8_t TRAMLINE_ACTIVE_MASK = (1 << 2) | (1 << 3);   // relay 
 
 // --- Alarms -----------------------------------------------------------------
 
-static constexpr bool     ENABLE_TURBINE_ALARM    = false;
-static constexpr bool     ENABLE_WOM_ALARM        = false;   // no WOM sensor yet: the seeder sends a fixed 540
-static constexpr uint16_t TURBINE_RUNNING_MIN_RPM = 50;      // below this the turbine counts as stopped
-static constexpr uint16_t WOM_RUNNING_MIN_RPM     = 50;      // below this the WOM counts as stopped
+// The fan has to turn while the machine is seeding - no air, no seed at the
+// coulters - so this alarm is always on. Below this the turbine counts as
+// stopped; in work it runs at around 3000 RPM, so the threshold only catches a
+// fan that has actually stopped, not one that is merely slow.
+static constexpr uint16_t TURBINE_RUNNING_MIN_RPM = 50;
+
+// ...and the condition has to hold this long before the screen takes over. The
+// fan takes a moment to come up when you move off, and the seeder only
+// recomputes its RPM every TURBINE_UPDATE_INTERVAL_MS, so without this every
+// start from a standstill would beep.
+static constexpr uint32_t TURBINE_ALARM_DELAY_MS = 3000;
+
 static constexpr uint32_t LINK_BUZZER_DELAY_MS    = 5000;    // a lost link beeps only after this long
 
 // --- Calibration run --------------------------------------------------------
@@ -133,10 +148,24 @@ static constexpr uint32_t CALIBRATION_START_TIMEOUT_MS = 2000;
 static constexpr uint16_t WHEEL_CALIB_DISTANCE_M = 100;
 static constexpr uint16_t WHEEL_CALIB_MIN_PULSES = 50;    // below this the result is refused
 
-// --- First-boot values, until changed on the Dawka and Kalibracja screens ---
-
-static constexpr uint16_t DEFAULT_DOSE_KG_PER_HA   = 40;
-static constexpr uint32_t DEFAULT_GRAMS_PER_100REV = 500;
+// --- First-boot values, and the restore path --------------------------------
+//
+// What a tractor board with an empty NVS starts from: a new board, or one after
+// `pio run -t erase`. A normal upload keeps NVS, so a board that has been set up
+// never reads these.
+//
+// This is also how a calibration is restored. The tractor's Ustawienia screen
+// prints exactly this block over USB; paste it over these lines and flash it,
+// and a blank board comes up with the machine's own numbers. Keep the printouts
+// in docs/calibration-settings.txt - nothing can write settings back into the
+// tractor over the radio or the serial line, on purpose.
+static constexpr uint16_t DEFAULT_DOSE_KG_PER_HA    = 40;
+static constexpr uint32_t DEFAULT_GRAMS_PER_100REV  = 500;
+static constexpr bool     DEFAULT_DISPENSER_ENABLED = false;
+static constexpr bool     DEFAULT_TRAMLINES_ENABLED = false;
+static constexpr bool     DEFAULT_SEED_LARGE        = false;
+static constexpr uint16_t DEFAULT_WHEEL_MM_SMALL    = WHEEL_MM_PER_PULSE_DEFAULT;
+static constexpr uint16_t DEFAULT_WHEEL_MM_LARGE    = WHEEL_MM_PER_PULSE_DEFAULT;
 
 
 // ===========================================================================

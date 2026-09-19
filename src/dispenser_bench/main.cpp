@@ -527,7 +527,7 @@ void setup()
     pinMode(ENCODER_B_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), encoderBPulseISR, RISING);
 
-    Serial.begin(115200);
+    Serial.begin(SERIAL_BAUD);
     delay(300);   // let the host open the port, so the banner is not lost
 
     bootInfo.reason    = esp_reset_reason();
