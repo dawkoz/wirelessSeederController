@@ -6,6 +6,10 @@ driver and motor are already chosen; the rest is the supporting hardware.
 Firmware pin assignments come from `include/machine_settings.h` — if you change
 a pin here, change it there too.
 
+**The wiring is drawn in [dispenser_wiring.svg](dispenser_wiring.svg)** — every
+pin on every board, the power input, a connection list and what gets soldered
+onto the MD13S. This document is the reasoning behind it.
+
 ---
 
 ## 1. Parts to order
@@ -24,21 +28,21 @@ before ordering.
 | 3 | **ESP32-DevKitC-32E V4** (38 pins, ESP32-WROOM-32E module, PCB antenna) | 1 | Any board with a classic ESP32 works — the firmware is built for `esp32dev`. **Not** an ESP32-S2/S3/C3/C6 board, and **not** a `-32U`/`-32UE` module, which needs an external antenna. |
 | 4 | **Pololu D24V22F5** step-down regulator, 5 V 2.5 A, 5.3–36 V in | 1 | The ESP32 cannot run from 12 V. Reverse-voltage protected, and its 36 V limit is safe behind the surge suppressor in item 14. **Do not use a bare LM2596 module.** For more margin: Pololu **D36V28F5** (5 V 3.2 A, up to 50 V in). |
 | 5 | **4-channel BSS138 logic-level converter** module | 1 | **Not optional.** The encoder runs at 5 V (its minimum is 3.5 V), and **its A/B outputs are pulled up to that 5 V on the encoder board** — connected raw they put 5 V on the ESP32. A resistor divider does not work here: with the on-board pull-up in the chain it only reaches about 2.5 V, right at the ESP32's logic threshold. The BSS138 module doesn't mind the pull-ups. **Not a TXB0104 converter** — that type misbehaves with pull-up resistors. |
-| 6 | Resistors **2 × 10 kΩ** (pull-downs) | 1 set | See §2.3 — keeps the motor stopped while the ESP32 is in reset. |
-| 7 | **Waterproof** inline blade fuse holder + **10 A** blade fuses, with spares | 1 | Safety, not convenience: an unfused 12 V feed to a 5.5 A motor on a vehicle is a fire risk. Fit it **where the cable takes power from the tractor**, not at the dispenser box — a fuse only protects the cable after it. Keep spares: item 14 blows it on purpose if someone jump-starts with 24 V. |
+| 6 | Resistors **2 × 10 kΩ** (pull-downs) | 1 set | See §2.3 — keeps the motor stopped while the ESP32 is in reset. Soldered straight onto the MD13S's Grove pins (§3.2). |
+| 7 | **Waterproof** inline blade fuse holder + **10 A** blade fuses, with spares | 1 | Safety, not convenience: an unfused 12 V feed to a 5.5 A motor on a vehicle is a fire risk. Fit it **right at the ISOBUS plug** — the tractor end of the cable — not at the dispenser box: a fuse only protects the cable after it, and the socket's own fuse is rated far above what 1.5 mm² cable can carry. Keep spares: item 14 blows it on purpose if someone jump-starts with 24 V. |
 | 8 | Pololu **#1084** 37D mounting bracket (pair) | 1 | Nothing holds the motor otherwise. Motor screws are included. |
 | 9 | **Jaw coupling** ("sprzęgło kłowe"), 6 mm bore on the motor side, rated **≥ 3 N·m** (L050 size or bigger) | 1 | The motor shaft is **6 mm, D-shaped, 16 mm long**; the other bore matches the auger shaft. Tighten the set screw on the flat. Small "encoder" couplings and aluminium helical/beam couplings are rated around 1 N·m or less — below this motor's 1.4 N·m stall torque — and slip or crack. |
-| 10 | **Plastic** IP65+ box (never metal — it blocks the radio), cable glands sized to the cables | 1 + 3 | Must fit the ESP32 on its terminal adapter, the MD13S (61 × 33 mm), the regulator and the fuse/TVS terminals. Glands grip only their clamping range: a 2 × 1.5 mm² rubber cable is about 9–10 mm across, which needs PG11 or M20, not PG7. |
+| 10 | **Plastic** IP65+ box (never metal — it blocks the radio), cable glands sized to the cables | 1 + 3 | Must fit the ESP32 on its terminal adapter, the MD13S (61 × 33 mm) with C1 on it, the regulator, the two distribution blocks and the TVS. The fuse is not in the box — it sits at the ISOBUS plug. Glands grip only their clamping range: a 2 × 1.5 mm² rubber cable is about 9–10 mm across, which needs PG11 or M20, not PG7. |
 | 11 | Power cable **2 × 1.5 mm²** (2 × 2.5 mm² for runs over a few metres), **rubber, oil- and UV-resistant**: H05RR-F / H07RN-F ("OnPD") | as needed | Must carry 5.5 A stall without dropping voltage. Ordinary PVC "OMY" cable stiffens in the cold and degrades in oil and sunlight on a farm machine. |
-| 12 | Terminal blocks / WAGO, ferrules, heat shrink | — | |
+| 12 | Terminal blocks / WAGO, ferrules, heat shrink | — | Two **4-way WAGO 221** (32 A, 0.2–4 mm²) are the `+` and `−` distribution points inside the box (§3.1). |
+| 20 | **ISOBUS implement-side plug** (ISO 11783-2 breakaway connector, 9-pin), sealed | 1 | The dispenser takes its 12 V from the power pins of the tractor's ISOBUS socket (§1.5 trap 12). Ask the John Deere dealer for the implement-side part number, or buy a sealed plug or a pre-made tail from an agricultural-electronics supplier. It must seal — the socket has a sealed cap for a reason. Only PWR and PWR_GND are wired. |
 
 ### 1.2 Strongly recommended — it will work on the bench without these and fail in the field
 
 | # | Part | Qty | What it protects against |
 |---|---|---|---|
-| 13 | Electrolytic **1000 µF, ≥ 35 V (50 V preferred), low ESR, 105 °C**, across the MD13S power terminals | 1 | Several metres of supply cable have enough inductance that 5.5 A current steps at 16 kHz PWM cause real voltage dips at the driver, and the regulator shares that rail — so those dips brown the ESP32 out mid-work. With short bench leads you will never see it; on the machine you will. The MD13S carries 2 × 330 µF itself; this adds bulk at the end of the long cable. **Never a 25 V part**: the rail can reach the suppressor's ~28–29 V clamp. |
-| 14 | Surge suppressor (TVS diode): **1.5KE20A** (through-hole, 1500 W) or **SMBJ18A** (SMD, 600 W), from +12 V to GND after the fuse and the reverse-polarity diode, band (cathode) to +12 V | 1 | Spikes on the tractor's 12 V. It must clamp **below the MD13S's 30 V**: 1.5KE20A clamps at 27.7 V, SMBJ18A at 29.2 V. **Not SMBJ24A (38.9 V) or 1.5KE24A (33.2 V)** — and the two families name parts differently (SMBJ by stand-off voltage, 1.5KE by breakdown voltage), so the "24" means different things. Both recommended parts start conducting around 19–20 V: normal charging (≤ 14.8 V) doesn't touch them; a 24 V jump start makes them conduct hard and blows the fuse, which is the point. A TVS absorbs spikes — a full alternator load dump with the battery disconnected can still destroy it, and then it fails short and the fuse opens. |
-| 15 | Reverse-polarity protection: a **single 10 A Schottky, MBR1045** (TO-220AC), in series with +12 V — or a P-channel MOSFET circuit — **plus a keyed connector** on the 12 V feed | 1 | One reversed connection during field servicing destroys the MD13S, which has no reverse protection of its own. The diode drops about 0.5 V and warms up only during stalls; screw it to the box wall or a small heatsink. Beware listings selling "SR1040" in TO-220 as a **dual 2 × 5 A** diode — one half is too small. A keyed connector makes a reversed plug-in impossible in the first place. |
+| 13 | Electrolytic **C1: 1000 µF, ≥ 35 V (50 V preferred), low ESR, 105 °C**, **soldered straight onto the MD13S `+`/`−` power pads** | 1 | The MD13S chops the motor current at 16 kHz, so the current it draws is a square wave at the motor current — up to ~4 A, 16,000 times a second. Its own 2 × 330 µF already supply most of that; C1 takes the local impedance from about 50 mΩ to 20 mΩ, so the switching current stays inside the box instead of running up and down the cable beside the encoder wires, and the ripple is shared by three capacitors instead of two. It is margin, not a load-bearing part — a 5.5 A stall sags a proper feed by well under a volt, which the 5 V regulator never notices, so it does not stand between the ESP32 and a brownout. Fit it anyway; it costs a few złoty. **Low ESR and 105 °C** because it carries 1–2 A RMS of ripple whenever the motor runs, which dries a general-purpose 85 °C part out in a season. **Never a 25 V part**: the rail can reach the suppressor's ~28–29 V clamp. Mounting: §3.2. |
+| 14 | Surge suppressor (TVS diode): **1.5KE20A** (through-hole, 1500 W) or **SMBJ18A** (SMD, 600 W), from +12 V to GND on the distribution blocks (§3.1), band (cathode) to +12 V | 1 | Spikes on the tractor's 12 V. Below its stand-off voltage it leaks a few microamps — electrically invisible until something goes wrong. It must clamp **below the MD13S's 30 V**: 1.5KE20A clamps at 27.7 V, SMBJ18A at 29.2 V. **Not SMBJ24A (38.9 V) or 1.5KE24A (33.2 V)** — and the two families name parts differently (SMBJ by stand-off voltage, 1.5KE by breakdown voltage), so the "24" means different things. Both recommended parts start conducting around 19–20 V: normal charging (≤ 14.8 V) doesn't touch them; a 24 V jump start makes them conduct hard and blows the fuse, which is the point. A TVS absorbs spikes — a full alternator load dump with the battery disconnected can still destroy it, and then it fails short and the fuse opens. |
 | 16 | ESP32 screw-terminal adapter **matching the board** | 1 | Vibration on farm equipment works dupont jumpers and breadboards loose — the most common cause of intermittent faults on machine-mounted electronics. The DevKitC V4 needs a **38-pin adapter with 25.4 mm (1″) between the rows** (Allegro lists them as "38pin 25.5mm … DevKitC-v4"); a 30-pin board needs the 30-pin adapter. |
 
 ### 1.3 Optional — buy only if your layout needs it
@@ -48,6 +52,7 @@ before ordering.
 | 17 | 6-core **shielded** cable (e.g. LiYCY 6 × 0.25 mm²) | Only if the motor is not right at the enclosure. 2 cores motor power (use heavier cable if the run is long) + 4 encoder. Shielding matters because the encoder lines would run alongside switched motor current. If the motor mounts on the box, the motor's own leads are enough. |
 | 18 | ~~100 nF ceramic decoupling capacitors~~ | **Skip these.** The ESP32 DevKit and the MD13S both carry their own local decoupling, and adding more at the signal header achieves nothing measurable here. |
 | 19 | Heatsink for the MD13S | Not needed. The MD13S is a full NMOS H-bridge rated 13 A continuous without one; this motor draws 200 mA typical and 5.5 A only at stall. |
+| 15 | Reverse-polarity protection — **not needed on the ISOBUS feed** | The ISOBUS plug is keyed and cannot go in reversed, which was the case this guarded against; a keyed connector where the cable enters the box covers servicing. A series **Schottky (MBR1045) is the wrong part here**: it drops ~0.5 V and dissipates 0.4–1 W the whole time the auger is metering (about 3 W in a stall), inside a sealed plastic box with no metal to sink the heat into. If you want protection anyway, use a **P-channel MOSFET** (e.g. IRF4905, ~20 mΩ: about 40 mV and 0.08 W at 2 A). Fit it so its **body diode points in the normal current direction** — for a P-channel in the `+` line that is drain to the supply, source to the load, deliberately "backwards" — with the gate to GND through 10 kΩ and a 15 V zener from gate to source (cathode at the source), because the TVS clamps at ~28 V and V<sub>GS</sub> max is ±20 V. With neither, a reversed supply forward-biases the MD13S's MOSFET body diodes and the TVS: roughly a dead short, which blows the 10 A fuse within milliseconds — whether the driver survives those milliseconds is a coin flip. The regulator is reverse-protected, so the ESP32 is safe either way. |
 
 ### 1.4 Where to buy in Poland
 
@@ -70,10 +75,12 @@ Allegro don't have.
 | 9 | Coupling | — | Allegro: "sprzęgło kłowe" with both bores; check the rated torque |
 | 10 | Box, glands | Kradex hermetic enclosures (IP65/IP67) and hermetic cable glands | Allegro |
 | 11 | Cable | — | Allegro: "przewód OnPD 2x1,5" or "H07RN-F 2x1,5" |
+| 12 | Distribution blocks | — | Allegro or any electrical wholesaler: "WAGO 221-414" |
 | 13 | 1000 µF 50 V low ESR | not in Botland's low-ESR range when checked | Allegro, TME, a-hobby.pl (Jamicon TL, 16 × 25 mm) |
 | 14 | TVS | — | Allegro: "SMBJ18A"; TME: "1.5KE20A" (Littelfuse or Diotec); eltron.pl: "P6KE20A" (600 W, also 27.7 V) |
-| 15 | Schottky | — | Allegro: "MBR1045" (a few zł) |
+| 15 | P-FET, only if you fit reverse protection | — | Allegro, TME: "IRF4905", plus a 15 V zener and a 10 kΩ resistor |
 | 16 | Terminal adapter | — | Allegro: "Adapter ESP32 38pin 25.5mm terminal shield DevKitC-v4" (~17 zł) |
+| 20 | ISOBUS plug | — | the John Deere dealer (the part for your socket); agricultural-electronics suppliers and Allegro: "wtyczka ISOBUS 9 pin", "ISOBUS implement connector" — roughly 50–150 zł for a sealed one |
 
 ### 1.5 Traps found when checking this list
 
@@ -91,8 +98,11 @@ Allegro don't have.
    for the encoder, not for up to 5.5 A: cut the red and black leads out of it
    and put them straight into the MD13S terminal block with ferrules.
 4. **MD13S details:**
-   - the control input is a Grove connector (DIR, PWM, NC, GND) — cut one end
-     off the supplied cable rather than looking for 0.1″ pins;
+   - the control input is a Grove connector — cut one end off the supplied
+     cable rather than looking for 0.1″ pins. Cytron's manual numbers its pins
+     1 GND, 2 PWM, 3 DIR, 4 NC; an earlier draft of this document listed them
+     the other way round. Don't settle it from a photo — find GND by
+     continuity (§3.2);
    - the terminal blocks come loose — solder them on;
    - Cytron's manual and the shop description disagree on which colour block
      is power and which is motor — **wire by the silkscreen `+`, `−`, `MA`,
@@ -110,8 +120,10 @@ Allegro don't have.
    with the laptop's USB plugged in, disconnect the regulator's 5 V from the
    ESP32's 5V pin; keep the grounds joined, and keep the encoder and the level
    shifter's HV side on the regulator.
-7. **"SR1040" is often a dual 2 × 5 A diode** in TO-220. Use a single 10 A
-   part such as MBR1045 (item 15).
+7. **No series diode for reverse polarity.** An earlier draft put an MBR1045
+   Schottky in the `+` line. On the keyed ISOBUS feed it guards against nothing
+   the plug doesn't already prevent, and it costs half a volt and up to a watt
+   of heat in a sealed box. Item 15 has the P-FET if you want protection anyway.
 8. **Small couplings.** The motor's stall torque (1.4 N·m) and the gearbox's
    instantaneous limit (2.5 N·m) are beyond what encoder couplings and small
    helical couplings take. Use a jaw coupling rated ≥ 3 N·m (item 9).
@@ -129,11 +141,38 @@ Allegro don't have.
 11. **Cable and glands.** PVC cable doesn't last on a farm machine, and a gland
     that doesn't grip the cable's outer diameter isn't IP65 at all (items 10,
     11).
-12. **Where the power comes from.** The fuse goes at the tractor end of the
-    cable (item 7). Take 12 V from a switched supply — the same one as the
-    seeder module — rather than straight off the battery: the ESP32 and the
-    regulator draw about 50 mA from 12 V around the clock, which flattens a
-    parked tractor's battery over a few weeks.
+12. **Where the power comes from — the ISOBUS socket, not the lighting
+    socket.** Take the dispenser's 12 V from the **PWR and PWR_GND pins of the
+    tractor's ISOBUS socket** (item 20), through the 10 A fuse right at the plug
+    (item 7).
+
+    The 7-pin lighting socket (ISO 1724) looks like the obvious source because
+    it powers a whole trailer's lights, but it is the wrong one for a motor.
+    Its position-light pins are live only while the lights are on. They share
+    one 7.5–10 A fuse with the tractor's own lights, so a 5.5 A stall on top of
+    them can blow that fuse and put the position lights out on the road — and a
+    10 A fuse of our own can never blow first on a 7.5 A circuit. And 1 mm²
+    wiring with a ground pin shared by the indicators and brake lights costs
+    ~0.5 V at 2 A and ~1.3 V at a stall, more as the plug corrodes. The lighting
+    socket is fine for the seeder module's logic; the motor needs a real feed.
+
+    The ISOBUS power pins are fused far higher on the tractor side, so the
+    10 A fuse at the plug is the one that blows — the fuse coordination a
+    lighting circuit cannot give. Wire **only PWR and PWR_GND**: never ECU_PWR
+    (a few amps, meant for control units), never the CAN pins, and never the
+    TBC pins, which are part of the bus termination. Take the pin numbering
+    from the tractor's operator's manual and confirm it with a meter before
+    crimping — those pins can source tens of amps, so mind the probes.
+
+    Two checks on the tractor, once:
+    - **Key out, meter PWR to PWR_GND.** If it is still live, the module's
+      ~50 mA idle draw is on the battery around the clock — about 100 Ah over a
+      winter. Unplug the seeder when it is parked for weeks; that happens
+      anyway when it is unhitched.
+    - **Load it with a bulb for a few minutes, key on.** Some tractors switch the
+      implement power off when no ISOBUS device answers on the bus; this module
+      never talks CAN. If the power drops out, that is a question for the
+      dealer.
 
 ---
 
@@ -184,6 +223,25 @@ So: **10 kΩ from MD13S PWM to GND, and 10 kΩ from MD13S DIR to GND.** This
 guarantees the motor is stopped whenever the ESP32 is in reset, unprogrammed,
 crashed, or physically removed from its socket.
 
+**What is documented and what isn't.** The ESP32 half is Espressif's own:
+the *ESP32 Pin List* says that during reset all pins are output-disabled, and
+its "At reset" column for GPIO 25 and 26 is empty — no input enable, no
+internal pull-up, no internal pull-down. The MD13S half is not documented:
+Cytron's manual gives the truth table and the logic levels but not the input
+circuit, so whether the board already pulls PWM low is unknown. Measure it
+before anything is connected: board unpowered, meter on resistance, PWM to
+GND. Tens of kΩ means Cytron fitted a pull-down; megohms means the pin floats.
+Driver makers who do document it fit one on purpose — Pololu puts 100 kΩ on
+the PWM and EN inputs of its MAX14870 carrier, for example.
+
+**Only the PWM one is a safety part.** The truth table: PWM low → both outputs
+low → motor stopped, whatever DIR does. The DIR pull-down only keeps the
+direction deterministic. Fit both anyway; they cost nothing.
+
+**Solder them straight onto the MD13S's Grove pins** (§3.2), not at the ESP32
+end: there they also hold the motor off if the Grove cable breaks or shakes
+loose, which on a vibrating machine is the likelier failure.
+
 A related note on why the pins were chosen: **GPIO 0, 5, 14 and 15 actually
 output a PWM signal during boot.** Had the motor PWM been on one of those, the
 motor would briefly spin every single time the board reset. GPIO 25 and 26 do
@@ -217,28 +275,36 @@ its input, expect a board that no longer boots.
 ### 3.1 Power distribution
 
 ```
-Tractor switched 12 V ──[ 10 A fuse, at the tractor end ]──── cable ────[ keyed connector ]──┐
-                                                                                             │
-                                           MBR1045 (anode from the connector) ───────────────┤
-                                                                                             │
-                                                                                  12 V rail ─┤
-                                                                                             │
-                             TVS 1.5KE20A / SMBJ18A, band to +12 V, other end to GND ────────┤
-                                                                                             │
-                                               1000 µF ≥ 35 V, + to +12 V ───────────────────┤
-                                                                                             │
-                             ┌───────────────────────────────────────────────────────────────┤
-                             │                                                               │
-                  MD13S `+` and `−`                                           D24V22F5 VIN and GND
-                             │                                                               │ 5 V
-                  motor on `MA` / `MB`                                                       ├── ESP32 `5V` pin (not while USB is plugged in)
-                                                                                             ├── encoder BLUE (Vcc)
-                                                                                             └── level shifter HV
+Tractor ISOBUS socket
+  PWR ─────[ F1 10 A, right at the plug ]── cable 2 × 1.5 mm² ── gland ──► + block (WAGO 221, 4-way)
+  PWR_GND ───────────────────────────────── same cable ────────── gland ──► − block (WAGO 221, 4-way)
+
++ block:  cable in · MD13S `+` · D24V22F5 VIN · TVS band (cathode)
+− block:  cable in · MD13S `−` · D24V22F5 GND · TVS plain end      ← the single ground point (§3.4)
+
+C1 1000 µF:  soldered straight onto the MD13S `+` / `−` pads, stripe to `−`, body glued down (§3.2)
+D24V22F5 5 V ──► ESP32 `5V` (not while USB is plugged in) · encoder BLUE (Vcc) · level shifter HV
 ```
 
+Everything meets on **two distribution blocks right beside the driver**, one
+for `+` and one for `−`, with one short wire from each to the MD13S's screw
+terminal. Landing four conductors of mixed gauge under one screw of the MD13S's
+terminal block is not a joint that survives a season of vibration; a 4-way
+WAGO 221 takes them cleanly and lets the driver come out for service without
+taking the node apart.
+
+**C1 is the one part that must be closer still** — on the MD13S's own pads,
+because its whole job is to supply the switching current locally (item 13).
+**The TVS sits on the blocks**: in a box this small the difference between the
+cable gland and the driver is a fraction of a microhenry, and one junction is
+more reliable than two.
+
 The **regulator feeds only the ESP32, the encoder and the level shifter's HV
-side**. Motor current never passes through it. The level shifter's LV side takes
-3.3 V from the ESP32's `3V3` pin.
+side**, and takes its 12 V from the same blocks, so C1 sits between the cable
+and both loads. Motor current never passes through it. The level shifter's LV
+side takes 3.3 V from the ESP32's `3V3` pin.
+
+There is no series diode — the ISOBUS plug is keyed (item 15).
 
 ### 3.2 MD13S
 
@@ -248,8 +314,8 @@ blocks on first; they ship loose.
 
 | MD13S | Connects to |
 |---|---|
-| Terminal `+` | 12 V rail (after fuse, diode, TVS and capacitor) |
-| Terminal `−` | Ground, at the single ground point (§3.4) |
+| Terminal `+` | the `+` distribution block (§3.1); C1's `+` leg soldered to its pad |
+| Terminal `−` | the `−` distribution block — the single ground point (§3.4); C1's `−` leg (stripe) soldered to its pad |
 | Terminal `MA` | Motor **red** wire |
 | Terminal `MB` | Motor **black** wire |
 | Grove `PWM` | ESP32 **GPIO 25**, plus **10 kΩ to GND** (§2.3) |
@@ -265,6 +331,29 @@ With PWM low, both motor outputs go low, which brakes the motor.
 
 The two test buttons on the board (MA, MB) drive the motor directly, whatever
 the ESP32 is doing. Never press them with the auger connected or hands near it.
+
+**Which Grove pin is which.** Cytron's manual numbers them 1 GND, 2 PWM,
+3 DIR, 4 NC. Don't trust a pin order read off a photo, or this document's
+earlier drafts: with the board unpowered, find GND by continuity to the `−`
+power terminal, then read PWM and DIR off the silkscreen.
+
+**Fitting the pull-downs.** Solder the two 10 kΩ straight onto the Grove pins,
+PWM → GND and DIR → GND (§2.3 says why there). 0805 SMD resistors laid flat
+across the pads, or through-hole parts with the leads cut short and sleeved.
+Then check them before anything else is connected: about 10 kΩ from each pin
+to GND, or less if the board turns out to have its own pull-down in parallel.
+
+**Fitting C1.** Across the **power** block, `+` and `−` — never `MA`/`MB`,
+where it would sit on a bridge reversing at 16 kHz and destroy itself and
+probably the driver. Solder it to the pads under the terminal block, stripe
+(`−`) to `−`: with no series diode it has no reverse protection, and a
+reversed electrolytic vents or bursts. Keep its leads to a few centimetres at
+most — lead inductance is exactly what it is there to beat. Then **fix the
+body down** with RTV, hot glue or a cable tie: a 16 × 25 mm can shaken for a
+season on its own two legs work-hardens them until they snap at the seal. If
+you would rather not solder to the board, crimp C1's leg and the feed wire into
+one ferrule so the screw clamps a single bundle. The first plug-in may spark
+slightly as about 1660 µF charges (roughly 0.16 J) — normal.
 
 ### 3.3 Motor and encoder
 
@@ -298,16 +387,33 @@ pull-up sits in series with the divider and the high level ends up around
 2.5 V, right at the ESP32's threshold. The firmware also enables the ESP32's
 internal pull-ups on GPIO 32/33, which is harmless alongside the module's.
 
+**Channel A is the heart of the production firmware** — cut it and nothing
+works. Every 100 ms the dispenser turns its edge count into the measured shaft
+RPM, and the feed-forward + PI controller corrects the duty against it; that is
+what absorbs a 12.6 V battery versus a 14.4 V alternator, and auger load. The
+clog detector, the 100-revolution calibration run and the distance ledger all
+count the same edges. With no encoder the measured RPM stays 0, the clog
+detector fires after 1.5 s and the dispenser never meters.
+
 Channel B is wired but unused by the production firmware — the auger turns one
 way, so rising edges on A alone give ample resolution at half the interrupt
-load. The bench test uses it to tell the two directions apart.
+load. The bench test uses it to tell the two directions apart, so keep it
+connected: the bench image is needed again on the fitted machine (§6, "What to
+write down").
 
 ### 3.4 Grounding
 
-Join motor ground and logic ground at **one single point**, at the MD13S power
-terminal. Do not daisy-chain the ESP32's ground through the motor current path
-— the volt-drop along that wire during a 5.5 A stall appears as ground noise on
-the encoder inputs and corrupts the count.
+Join motor ground and logic ground at **one single point**: the `−`
+distribution block beside the MD13S (§3.1). Do not daisy-chain the ESP32's
+ground through the motor current path — the volt-drop along that wire during a
+5.5 A stall appears as ground noise on the encoder inputs and corrupts the
+count.
+
+**The return to the tractor is PWR_GND in the supply cable — never the seeder
+frame.** Check there is no continuity from the single ground point to the
+frame. If the motor case, the bracket or the `−` ends up bonded to the machine,
+the frame and the three-point linkage become a second return path, and part of
+every motor current — a 5.5 A stall included — comes back through the hitch.
 
 ---
 
@@ -315,12 +421,12 @@ the encoder inputs and corrupts the count.
 
 1. **Check the encoder's blue wire goes to 5 V, not 12 V.** This is the one
    mistake that destroys the ESP32 — the encoder's outputs sit at its Vcc.
-2. Confirm the two 10 kΩ pull-downs are present on PWM and DIR (§2.3).
-3. Confirm continuity from ESP32 GND to MD13S GND before applying 12 V.
-4. Check the polarity of the protection parts with the multimeter's diode test
-   before the first 12 V: the MBR1045 conducts from the connector towards the
-   12 V rail, and the TVS's band faces +12 V. A reversed TVS shorts the rail
-   and blows the fuse.
+2. Confirm the two 10 kΩ pull-downs are present on PWM and DIR (§2.3, §3.2).
+3. Confirm continuity from ESP32 GND to MD13S GND before applying 12 V — and
+   **no** continuity from that ground to the seeder frame (§3.4).
+4. Check the polarity with the multimeter's diode test before the first 12 V:
+   the TVS's band faces +12 V — a reversed TVS shorts the rail and blows the
+   fuse — and C1's stripe goes to `−`.
 5. Power the ESP32 from **one source only** (§1.5 trap 6): with USB plugged in,
    the regulator's 5 V stays off the ESP32 `5V` pin.
 6. **Check the encoder signals with a multimeter before `LV1`/`LV2` go to
@@ -348,6 +454,8 @@ the encoder inputs and corrupts the count.
    meter.
 8. If the auger runs the wrong way, either swap the motor's red and black leads
    or flip `MOTOR_DIR_FORWARD` in `include/machine_settings.h`.
+9. Once, on the tractor: the two ISOBUS checks in §1.5 trap 12 — whether PWR is
+   still live with the key out, and whether it stays up under a bulb's load.
 
 ## 5. First calibration
 
@@ -467,5 +575,8 @@ it flashed would look dead to the tractor.
 - [Littelfuse SMBJ series datasheet](https://www.littelfuse.com/assetdocs/tvs-diodes-smbj-series-datasheet?assetguid=ba555e99-a12d-4f72-a0b6-86b06c67171e) and [1.5KE series datasheet](https://www.digikey.com/htmldatasheets/production/99296/0/0/1/1n6267a-1-5kexxa-series.html) (clamping voltages)
 - Botland product pages checked for §1.4: [MD13S](https://botland.store/motor-drivers-modules/12412-cytron-md13s-single-channel-30v-13a-motor-controller-5904422377090.html), [Pololu 4752](https://botland.store/dc-motors-with-gearbox-and-encoders/16115-301metal-gearmotor-12v-37dx68lmm-with-64-cpr-encoder-pololu-4752-5904422325213.html), [ESP32-DevKitC-32E](https://botland.store/esp32-wifi-and-bt-modules/8306-esp32-devkitc-32e-v4-wifi-bt-42-platform-with-the-module-esp-wroom-32e-5904422336394.html), [D24V22F5](https://botland.store/converters-step-down/4978-step-down-voltage-converter-d24v22f5-5v-25a-pololu-2858-5904422365769.html), [BSS138 level shifter](https://botland.store/voltage-converters/6117-4-channel-logic-level-converter-5904422365189.html), [Pololu 1084 bracket](https://botland.store/bracket/2343-aluminium-motor-mount-37d-2pcs-pololu-1084-5904422300258.html)
 - [ESP-IDF GPIO & RTC GPIO reference](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/gpio.html)
+- [Espressif ESP32 Pin List](https://download.kamami.pl/p563391-esp32_chip_pin_list_en.pdf) (§2.3: every pin output-disabled during reset; no pull-up or pull-down on GPIO 25/26 at reset)
+- [Pololu MAX14870 motor driver carrier](https://www.pololu.com/product/2961) (§2.3: pull-downs on a driver's control inputs as a deliberate design choice)
+- [Arduino Forum — pull-downs on output pins during power-up and reset](https://forum.arduino.cc/t/pull-down-resistor-on-digital-io-pin-used-as-output-low-level-on-this-pin-during-power-up-restart/917732) (§2.3: not needed on opto-isolated inputs, worth it on critical control lines)
 - [ESP32-WROOM-32 datasheet](https://documentation.espressif.com/esp32-wroom-32_datasheet_en.html)
 - [Espressif ESP32 hardware design guidelines](https://docs.espressif.com/projects/esp-hardware-design-guidelines/en/latest/esp32/schematic-checklist.html)

@@ -23,7 +23,7 @@ A wireless controller for a Kverneland Accord-style seeder, mimicking the Kverne
 
 - **Seeder module** (on the seeder): turbine RPM sensor, ground-wheel sensor (ground speed and "is the seeder moving"), tramline relay.
 - **Tractor module** (in the cab): OLED display, one button that drives every screen, LEDs and buzzer. Owns the tramline selection and the dispenser settings.
-- **Dispenser module** (on the seeder): fertilizer dispenser motor driven through a Cytron motor driver, metered from the seeder's ground speed. A separate board for one reason only — the seeder's enclosure has no room left. It gets its own 12 V power cable; everything else is wireless like the other two boards. **Built and bench-tested, not yet fitted to the machine.**
+- **Dispenser module** (on the seeder): fertilizer dispenser motor driven through a Cytron motor driver, metered from the seeder's ground speed. A separate board for one reason only — the seeder's enclosure has no room left. It gets its own 12 V power cable, from the power pins of the tractor's ISOBUS socket; everything else is wireless like the other two boards. **Built and bench-tested, not yet fitted to the machine.**
 
 ## Philosophy
 
@@ -61,6 +61,7 @@ src/dispenser/dispenser_logic.h   the dispenser's decision logic, header-only an
 src/dispenser/dispenser_io.h/.cpp encoder, motor output and the packet inbox - the only dispenser code that touches pins
 src/dispenser_bench/        bench test image for the dispenser module - its own environment, never fitted (see docs/dispenser_module_hardware.md)
 docs/dispenser_module_hardware.md   dispenser parts list, pin verification, wiring, bench test
+docs/dispenser_wiring.svg           the same wiring drawn out: every pin, the power input, a connection list
 docs/calibration-settings.txt       what the tractor has stored, exported over USB - the backup for an erased or replaced board
 ```
 
@@ -113,7 +114,7 @@ OLED: SH1106 128x64 over I2C, address `0x3C`. The single button drives every scr
 
 ### Dispenser ESP32 (`src/dispenser/main.cpp`)
 
-Built and bench-tested, not yet fitted to the machine. **Cytron MD13S** driver (PWM + DIR, 13 A continuous) and a **Pololu 4752** motor (37Dx68L, 30:1, 12 V, 330 RPM, 14 kg·cm, 5.5 A stall) with a built-in quadrature encoder (64 CPR motor shaft → 1920 CPR output shaft). Powered by its own 12 V line; control/telemetry wireless like the other two boards.
+Built and bench-tested, not yet fitted to the machine. **Cytron MD13S** driver (PWM + DIR, 13 A continuous) and a **Pololu 4752** motor (37Dx68L, 30:1, 12 V, 330 RPM, 14 kg·cm, 5.5 A stall) with a built-in quadrature encoder (64 CPR motor shaft → 1920 CPR output shaft). Powered by its own 12 V line from the ISOBUS socket's PWR / PWR_GND pins, through a 10 A fuse at the plug; control/telemetry wireless like the other two boards.
 
 | Pin | Function                                                     |
 | --- | ------------------------------------------------------------ |
@@ -534,3 +535,5 @@ Governing principle, agreed with the user: **a gap in the field is a permanent d
 19. **A pure pulse-lock loop for the dispenser, with no speed term** - the electronic-gearbox form of the same idea. It would have meant rewriting the RPM loop the bench had already proved, and most of the D tests, to arrive in the same place; the distance ledger sits on top of them instead.
 20. **Deriving the large-seed distance per pulse from the small-seed one by the gear ratio** - declined by the user: both gears are measured, so a wrong tooth count cannot quietly halve a dose.
 21. **Correcting the half-pulse of debt the ledger takes on when it starts counting** - the first pulse it credits is partly ground covered before it was looking, about 12 g of fertilizer and always in the direction of applying more. Removing that bias needs another piece of state and trades it for an under-application at the start of every pass.
+22. **Powering the dispenser from the 7-pin lighting socket** - its position-light pins are live only with the lights on, share one 7.5–10 A fuse with the tractor's own lights (a stall could put the position lights out on the road, and no fuse of ours can blow first), and run on 1 mm² wiring with a ground shared by the indicators and brake lights. The ISOBUS socket's power pins are the feed (agreed with the user, 21 September 2026).
+23. **A series Schottky for reverse polarity** - the ISOBUS plug is keyed, and the diode would cost ~0.5 V and up to ~1 W of heat in a sealed plastic box for a case the connector already prevents. A P-FET is the option if protection is ever wanted (`docs/dispenser_module_hardware.md`, item 15).
