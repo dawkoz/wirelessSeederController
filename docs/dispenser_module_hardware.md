@@ -533,6 +533,20 @@ to fit it, and asks you to remove it before it does anything else.
 `a` runs all of them in that order, `r` prints the summary so far, `x` stops the
 motor, `?` reprints the menu and the boot report.
 
+`p` runs **one simulated pass** on its own — it is not part of `a`, and it is
+for watching rather than proving. The tractor and seeder packets describe a
+machine that stands for 2 s, pulls away to 8 km/h over 3 s, seeds for 6 s,
+slows to a stop over 3 s and stands again (40 kg/ha, 1000 g per 100
+revolutions, so 213 RPM while seeding). Twice a second it prints the ground
+speed, the RPM that speed asks for, the dispenser's target with the ledger's
+trim, the shaft RPM measured over the last half second, and the duty. P01
+passes if the shaft stays still while the machine stands, the duty drops to 0
+within 300 ms of the stop and stays there, and nothing reads as a clog. The
+shaft turns delivered against the ground covered are printed for information
+only — the ledger drops what it still owes at a stop, so a short pass with
+ramps is not held to M11's 3 %. The speed, dose, calibration and timings are
+constants at the top of `src/dispenser_bench/tests_ride.h`.
+
 ### What to write down
 
 The summary prints the measured values worth copying into

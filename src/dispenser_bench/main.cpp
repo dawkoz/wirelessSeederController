@@ -476,6 +476,7 @@ static void printMenu()
     Serial.println("  c  calibration run (C01-C06, motor)");
     Serial.println("  k  clog and unclogging (K01-K07, motor)");
     Serial.println("  a  all of the above, in that order");
+    Serial.println("  p  one simulated pass: pull away, seed 6 s, stop (P01, motor, not in a)");
     Serial.println("  r  report so far");
     Serial.println("  x  motor off now");
     Serial.println("  ?  this menu and the boot report");
@@ -515,6 +516,7 @@ static bool askMotorChecklist()
 #include "tests_packets.h"
 #include "tests_hardware.h"
 #include "tests_scenarios.h"
+#include "tests_ride.h"
 
 // ---------------------------------------------------------------------------
 
@@ -572,7 +574,7 @@ void loop()
     if (c == '\r' || c == '\n' || c < 0) return;
 
     // Only the commands that turn the motor need the setup checklist.
-    bool motorCommand = (c == 'h' || c == 'm' || c == 'c' || c == 'k' || c == 'a');
+    bool motorCommand = (c == 'h' || c == 'm' || c == 'c' || c == 'k' || c == 'a' || c == 'p');
     if (motorCommand && !askMotorChecklist()) {
         Serial.println(">> motor tests skipped");
         return;
@@ -609,6 +611,9 @@ void loop()
             if (!abortRequested) runMeteringTests();
             if (!abortRequested) runCalibrationTests();
             if (!abortRequested) runClogTests();
+            break;
+        case 'p':
+            runRideTest();
             break;
         case 'r':
             reportSummary();
