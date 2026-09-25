@@ -121,7 +121,9 @@ static constexpr uint8_t TRAMLINE_ACTIVE_MASK = (1 << 2) | (1 << 3);   // relay 
 // --- Alarms -----------------------------------------------------------------
 
 // The fan has to turn while the machine is seeding - no air, no seed at the
-// coulters - so this alarm is always on. Below this the turbine counts as
+// coulters - so this alarm is on at every power-up. Screen 21 (Dmuchawa) turns
+// it off until the next one, for testing a stationary machine with no fan
+// running; it is never stored. Below this the turbine counts as
 // stopped; in work it runs at around 3000 RPM, so the threshold only catches a
 // fan that has actually stopped, not one that is merely slow.
 static constexpr uint16_t TURBINE_RUNNING_MIN_RPM = 50;

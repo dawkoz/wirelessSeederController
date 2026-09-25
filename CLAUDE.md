@@ -165,9 +165,10 @@ Power on: Adafruit logo while starting up, 0.5 s beep
     │                └── Kalibracja ─ 17 CONFIRM
     │                                 └── OK ─ 18 DRIVING
     │                                          └── 19 RESULT
-    └── Ustawienia ─ 20 SETTINGS, and the USB export
+    ├── Ustawienia ─ 20 SETTINGS, and the USB export
+    └── Dmuchawa ─── 21 BLOWER ALARM switch, back on at every power-up
 
-The menu has six items and four rows: the window follows the cursor, and
+The menu has seven items and four rows: the window follows the cursor, and
 wrapping past the last item brings it back to the top.
 
 Over any screen while the dispenser reports a clog:
@@ -180,41 +181,41 @@ Screens 7–11 are one screen. Its content changes by itself as the dispenser re
 ### Mockups
 
 ```
-┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
-│[Praca              ]│  │RPM 3150             │  │DMUCHAWA             │  │DOZOWNIK             │
-│ Dawka               │  │6.4km/h  M kg/ha: 40 │  │                     │  │                     │
-│ Kalibracja          │  │                     │  │STOI                 │  │ZA SZYBKO            │
-│ Sciezki             │  │Przejazd:       3    │  │                     │  │                     │
-│                     │  │Doz:42 RPM     [*   ]│  │Dlugi klik = menu    │  │Dlugi klik = menu    │
-└─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
-        1. Menu                  2. Work              3a. Blower stopped       3b. Dispenser too fast
-
 ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
-│DAWKA kg/ha     WYBOR│  │KALIBR. g/100   WYBOR│  │Start kalibracji?    │
-│                     │  │                     │  │100 obrotow          │
-│      [0] 4  0       │  │   [0] 0  5  0  0    │  │                     │
-│                     │  │                     │  │[Anuluj             ]│
-│ WL.        ZAPISZ   │  │ TEST       ZAPISZ   │  │ START               │
-└─────────────────────┘  └─────────────────────┘  └─────────────────────┘
-     4. Dose editor       5. Calibration editor          6. Confirm
-
-┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
-│Kalibracja...        │  │GOTOWE               │  │Kalibracja           │
+│                     │  │[Praca              ]│  │ Sciezki             │
+│  Adafruit logo      │  │ Dawka               │  │ Nasiona             │
+│  (the library's     │  │ Kalibracja          │  │ Ustawienia          │
+│  start-up image)    │  │ Sciezki             │  │[Dmuchawa           ]│
 │                     │  │                     │  │                     │
-│ |##########-------| │  │Zwaz nawoz i wpisz   │  │MASZYNA              │
-│                     │  │wynik w gramach.     │  │                     │
-│         60%         │  │Nacisnij aby wrocic  │  │W RUCHU              │
 └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
-       7. Running                8. Done             9. Machine moving
+  0. Power-up, ~0.5 s            1. Menu             1b. Menu, scrolled
 
-┌─────────────────────┐
-│Kalibracja           │
-│                     │
-│BRAK                 │
-│                     │
-│DOZOWNIKA            │
-└─────────────────────┘
-    10. No dispenser
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│RPM 3150             │  │DMUCHAWA             │  │DOZOWNIK             │
+│6.4km/h  M kg/ha: 40 │  │                     │  │                     │
+│                     │  │STOI                 │  │ZA SZYBKO            │
+│Przejazd:       3    │  │                     │  │                     │
+│Doz:42 RPM     [*   ]│  │Dlugi klik = menu    │  │Dlugi klik = menu    │
+└─────────────────────┘  └─────────────────────┘  └─────────────────────┘
+        2. Work             3a. Blower stopped     3b. Dispenser too fast
+
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│DAWKA kg/ha     WYBOR│  │DAWKA kg/ha     ZMIEN│  │KALIBR. g/100   WYBOR│  │Start kalibracji?    │
+│                     │  │                     │  │                     │  │100 obrotow          │
+│      [0] 4  0       │  │       0 [4] 0       │  │   [0] 0  5  0  0    │  │                     │
+│                     │  │                     │  │                     │  │[Anuluj             ]│
+│ WL.        ZAPISZ   │  │ WL.        ZAPISZ   │  │ TEST       ZAPISZ   │  │ START               │
+└─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
+     4. Dose editor        4b. Changing a digit    5. Calibration editor          6. Confirm
+
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│Kalibracja...        │  │GOTOWE               │  │Kalibracja           │  │Kalibracja           │
+│                     │  │                     │  │                     │  │                     │
+│ |##########-------| │  │Zwaz nawoz i wpisz   │  │MASZYNA              │  │BRAK                 │
+│                     │  │wynik w gramach.     │  │                     │  │                     │
+│         60%         │  │Nacisnij aby wrocic  │  │W RUCHU              │  │DOZOWNIKA            │
+└─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
+       7. Running                8. Done             9. Machine moving         10. No dispenser
 
 ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
 │Kalibracja           │  │ZATKANIE!            │  │Zatkanie dozownika   │  │Odtykanie...         │
@@ -223,16 +224,16 @@ Screens 7–11 are one screen. Its content changes by itself as the dispenser re
 │                     │  │                     │  │                     │  │                     │
 │Nacisnij aby wrocic  │  │[OK                 ]│  │ Odetkaj             │  │         35%         │
 └─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
-   11. Interrupted          12. Clog alarm           13. Clog choice          14. Unclogging
+    11. Interrupted           12. Clog alarm          13. Clog choice           14. Unclogging
 
-┌─────────────────────┐
-│SCIEZKI              │
-│                     │
-│       [WYL.]        │
-│                     │
-│            ZAPISZ   │
-└─────────────────────┘
-     15. Tramlines
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│SCIEZKI              │  │ALARM DMUCHAWY       │  │ALARM DMUCHAWY       │
+│                     │  │                     │  │                     │
+│       [WYL.]        │  │       [WL.]         │  │       [WYL.]        │
+│                     │  │                     │  │                     │
+│            ZAPISZ   │  │            ZAPISZ   │  │do resetu   ZAPISZ   │
+└─────────────────────┘  └─────────────────────┘  └─────────────────────┘
+     15. Tramlines         21a. Blower alarm on    21b. Blower alarm off
 
 ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
 │[Male nas.        ]■ │  │Kalibracja kola      │  │Przejedz 100 m       │  │Wynik: 128 imp       │
@@ -241,17 +242,7 @@ Screens 7–11 are one screen. Its content changes by itself as the dispenser re
 │ Wroc                │  │[Anuluj             ]│  │                     │  │[Anuluj             ]│
 │                     │  │ OK                  │  │Dlugi klik = koniec  │  │ ZAPISZ              │
 └─────────────────────┘  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
-     16. Nasiona            17. Calibrate?            18. Driving              19. Result
-
-┌─────────────────────┐
-│Dawka:40 Kalib:500   │
-│Doz:WL. Sciezki:WYL. │
-│Nasiona:MALE         │
-│Kolo M:781 D:627mm   │
-│[Wyslij USB 115200  ]│
-│ Wroc                │
-└─────────────────────┘
-     20. Settings
+      16. Nasiona             17. Calibrate?            18. Driving               19. Result
 
 ┌─────────────────────┐
 │Kalibracja kola      │
@@ -261,7 +252,24 @@ Screens 7–11 are one screen. Its content changes by itself as the dispenser re
 │                     │
 └─────────────────────┘
     19b. Failed run
+
+┌─────────────────────┐  ┌─────────────────────┐
+│Dawka:40 Kalib:500   │  │Dawka:40 Kalib:500   │
+│Doz:WL. Sciezki:WYL. │  │Doz:WL. Sciezki:WYL. │
+│Nasiona:MALE         │  │Nasiona:MALE         │
+│Kolo M:781 D:627mm   │  │Kolo M:781 D:627mm   │
+│[Wyslij USB 115200  ]│  │[Wyslano!           ]│
+│ Wroc                │  │ Wroc                │
+└─────────────────────┘  └─────────────────────┘
+      20. Settings         20b. Just sent, 2 s
 ```
+
+The menu shows four of its seven items at a time and the window follows the
+cursor, so `Dmuchawa` only comes into view once the cursor gets there (1b is the
+last window). 4b is the editor with a digit being changed: the label says
+`ZMIEN` and a short press adds 1; screen 5 changes the same way. 20b shows for
+2 s after a send. 21 comes up as 21a at every power-up; 21b's `do resetu` says
+the alarm stays off only until the next one.
 
 On 16 the inverted row is the cursor and the small square marks the size in
 use — with one button the two cannot both be shown by highlighting. Screen 19
@@ -302,9 +310,9 @@ restarted, so the difference means nothing), `Za malo impulsow` (under
 
 | Screen               | Content                                                                                                                                                                                                                                                                                                                                                               | Short press                                                      | Long press                                                |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------- |
-| 1 Menu               | `Praca`, `Dawka`, `Kalibracja`, `Sciezki`, `Nasiona`, `Ustawienia` — four rows at a time, the window following the cursor. Starts on `Praca`, then stays on the item last opened                                                                                                                                                                                                                                                                      | next item                                                        | open it                                                   |
+| 1 Menu               | `Praca`, `Dawka`, `Kalibracja`, `Sciezki`, `Nasiona`, `Ustawienia`, `Dmuchawa` — four rows at a time, the window following the cursor. Starts on `Praca`, then stays on the item last opened                                                                                                                                                                                                                                                                      | next item                                                        | open it                                                   |
 | 2 Work               | turbine RPM, ground speed, the seed-size gear (`M` or `D`) and the dose in `kg/ha` — the dose is drawn only while the dispenser is switched on, so a blank there means it is off. Pass number 1–6 in large digits; while tramlines are off, `Sciezki: WYL.` takes that place. The bottom row is `BRAK:` while a link is down (`S` seeder, `D` dispenser once it has been heard, `S-D` they cannot hear each other), otherwise the dispenser's measured shaft RPM (`Doz:42 RPM`) and a four-frame animation that runs only while the auger is actually being driven. An empty bottom row means all is well and the dispenser is off. While the seeder is unheard the turbine RPM and the speed are drawn as `???`, the stored values untouched | next pass, 6 → 1 (nothing while tramlines are off)               | back to 1                                                 |
-| 3a Blower            | `DMUCHAWA STOI` — the machine is moving and the seeder reports the turbine below `TURBINE_RUNNING_MIN_RPM`, held for `TURBINE_ALARM_DELAY_MS` so that moving off before the fan is up to speed does not beep. Only on telemetry still arriving: a silent seeder is `BRAK: S`, not a fan fault |                                                    nothing (the pass number is hidden, so it must not change blind) | back to 1                                                 |
+| 3a Blower            | `DMUCHAWA STOI` — the machine is moving and the seeder reports the turbine below `TURBINE_RUNNING_MIN_RPM`, held for `TURBINE_ALARM_DELAY_MS` so that moving off before the fan is up to speed does not beep. Only on telemetry still arriving: a silent seeder is `BRAK: S`, not a fan fault. Never while switched off on 21 |                                                    nothing (the pass number is hidden, so it must not change blind) | back to 1                                                 |
 | 3b Dispenser         | `DOZOWNIK ZA SZYBKO` (driving faster than the dispenser can keep up with; only while the dispenser is heard — a silent dispenser is announced by `BRAK: D` instead)                                                                                                                                                                                                   | nothing (the pass number is hidden, so it must not change blind) | back to 1                                                 |
 | 4 Dose editor        | dose in kg/ha, `WL./WYL.`, `ZAPISZ`                                                                                                                                                                                                                                                                                                                                   | see Editors                                                      | see Editors                                               |
 | 5 Calibration editor | grams per 100 dispenser revolutions, `TEST`, `ZAPISZ`                                                                                                                                                                                                                                                                                                                 | see Editors                                                      | see Editors                                               |
@@ -323,6 +331,7 @@ restarted, so the difference means nothing), `Za malo impulsow` (under
 | 18 Driving | the pulses counted since START, in large digits. No distance: it could only be shown using the value being replaced, and the 100 m is measured on the ground. Can be driven during normal work — it only reads the seeder's cumulative counter | ignored, so a stray press cannot throw away a 100 m drive | finish → 19 |
 | 20 Ustawienia | everything the board keeps in NVS, and two rows: send it over USB (the baud rate is on the row) or leave. The only way settings leave the board — nothing can write them back in, see docs/calibration-settings.txt | switch | send, printing the block and showing `Wyslano!`; `Wroc` → 1 |
 | 19 Result | the measured mm per pulse against the one it would replace, or why the run gave nothing | switch (nothing to switch on a failure) | `Anuluj` → 16; `ZAPISZ` stores it for the size being calibrated → 16 |
+| 21 Dmuchawa | `ALARM DMUCHAWY`, the switch `WL.`/`WYL.`, `ZAPISZ`; `do resetu` while it is off. For testing a stationary machine: never stored, so every power-up starts with the alarm on | move the cursor | switch: flip it, in force at once; `ZAPISZ`: → 1 |
 
 ### Editors (4 and 5)
 
@@ -338,7 +347,7 @@ restarted, so the difference means nothing), `Za malo impulsow` (under
 
 - **Buzzer:** beeps ¼ s on, ¼ s off while a dispenser fault is active, including on screens that don't show the fault, and while the clog alarm (12) shows — also on screens that don't show it. It also beeps, with nothing on screen, when a board that was heard has been silent for about 6 s, or when the seeder and dispenser haven't heard each other for about 6 s.
 - **LEDs:** green = all links fine. Blue blinking = a link is down, including the seeder not heard since power-on. Yellow = the seeder's last report says the tramline relay is on.
-- **Two faults can take over the work screen**, both always on: the blower (3a) and the dispenser over-speed (3b). Nothing is acknowledged - they clear themselves when the machine does, and until then the buzzer runs and a long press is the only thing that works. A lost link is not one of them: it is the `BRAK:` letters, the blue LED and, after `LINK_BUZZER_DELAY_MS`, the buzzer. There was a WOM alarm; it was removed on 18 September 2026 because no WOM sensor exists.
+- **Two faults can take over the work screen**: the blower (3a), on at every power-up and off only while screen 21 says so, and the dispenser over-speed (3b), always on. Nothing is acknowledged - they clear themselves when the machine does, and until then the buzzer runs and a long press is the only thing that works. A lost link is not one of them: it is the `BRAK:` letters, the blue LED and, after `LINK_BUZZER_DELAY_MS`, the buzzer. There was a WOM alarm; it was removed on 18 September 2026 because no WOM sensor exists.
 
 ## Dispenser behaviour
 
@@ -401,6 +410,7 @@ The rules below apply to every new task written into this section.
   - All three boards on a desk: pull power from each in turn — the seeder holds its relay, the dispenser stops when the seeder goes, the right `BRAK:` letters appear. With a fault beeping, cut the seeder's power: the buzzer must stop (regression check for the old stuck-buzzer bug).
   - **Fit the 6 magnets and calibrate both gears.** `Nasiona` → `Kalibracja` on the tractor, once in each seed-size gear, driving `WHEEL_CALIB_DISTANCE_M` in the field with the machine working so that wheel slip is part of the number. Until then every board meters on `WHEEL_MM_PER_PULSE_DEFAULT` (785 mm), which is an estimate. Check the counts differ between the gears by roughly the ratio you measured, and that the seed-rate setting really does not change them. Export the result afterwards (`Ustawienia` → `Wyslij`) and keep the block in [docs/calibration-settings.txt](docs/calibration-settings.txt). Then set `WHEEL_MM_PER_PULSE_DEFAULT` to the measured value for the gear used most and reflash: it is the fallback before the first command arrives, and `WHEEL_MIN_PULSE_GAP_US` - the interrupt's noise filter, which has to be a compile-time constant - is derived from it. At 785 mm it ignores pulses closer together than ~40 km/h; a measured value much below 400 mm would make that filter start clipping real pulses at working speed.
   - Dispenser calibration: check `ENCODER_EDGES_PER_REV` by hand-turning 10 revolutions (≈ 4800 edges), then `Kalibracja` → `TEST`, catch and weigh the output, enter it.
+  - **Stationary dose check** (after the dispenser calibration, with the same fertilizer): machine on stands so the wheel turns the metering drive, `Dmuchawa` → `WYL.`, dispenser `WL.` with a dose. Count pulses on screen 18 (`Nasiona` → `Kalibracja` → `OK`; leave with `Anuluj`, never `ZAPISZ`), turn the wheel steadily and without pauses for 100+ pulses, weigh the output. Expected grams = pulses × distance per pulse [mm] / 1000 × `WORKING_WIDTH_CM` / 100 × dose / 10 — with the distance per pulse the tractor sends for the gear in use (`Ustawienia`, `Kolo M/D`). Each stop and start costs up to about one pulse's worth, and a run that showed `ZA SZYBKO` is not valid.
   - Blockage: stall the running dispenser; the tractor must alarm.
 - **Auger output per revolution** — mechanical, not firmware: 40 kg/ha at 10 km/h needs roughly ≥ 800 g per 100 revolutions (Design record → Dispenser). Firmware clamps and alarms either way.
 - **Statistics screen** — agreed with the user, not designed in detail: hectares, kg applied, average kg/ha, wheel pulses, dispenser revolutions, and `ZERUJ` with a confirmation. The main menu is now full (four rows at text size 2), so a fifth item needs scrolling. The encoder counts reverse turns too, so leave `Unclogging` out of the revolution total.
@@ -434,6 +444,7 @@ Everything below is written and builds with `pio run` (four environments, zero e
 - **Protocol v5 + distance per pulse as a setting** — the wheel sensor turned out to be on the metering drive, whose ratio to the ground wheel depends on the machine's seed-size gear, so `WHEEL_MM_PER_PULSE` could not be a constant: `TractorCommand` now carries `wheelMmPerPulse` and the seeder meters with what it is sent. The fixed 2 s stop timeout became a speed (`WHEEL_MIN_SPEED_MM_S`), so a slow pulse rate can no longer read as "stopped", and the noise gate is derived from a top speed instead of being a literal. 11 bench checks (W01–W11) drive `wheel_speed.h` with simulated pulse trains.
 - **Seed-size screen and wheel calibration** — a fifth menu item `Nasiona` (so the menu scrolls), the size stored on the tractor and shown on the work screen, and a wizard that measures the distance per pulse by driving 100 m (screens 16–19). It refuses a run that a seeder reboot or too few pulses made meaningless, and a radio gap during the drive costs nothing, because the counter it reads is cumulative.
 - **Settings export** — an `Ustawienia` screen (screen 20) listing everything the tractor keeps in NVS, with one row that prints it over USB at `SERIAL_BAUD` and confirms with `Wyslano!`. The printout doubles as the first-boot constants, so an erased or replaced board is restored by pasting into `include/machine_settings.h`. Export only: nothing can write a setting into the board.
+- **Blower alarm switch** — a seventh menu item `Dmuchawa` (screen 21) turns the blower alarm off until the next power-up, for testing a stationary machine; it shares its drawing with the tramline screen.
 - **Distance ledger** — the dispenser meters to the ground rather than to the speed estimate: a debt in shaft revolutions, paid off over `LEDGER_CATCHUP_SECONDS`, with the ground interpolated between pulses. 12 logic checks (L01–L12) and a motor-in-the-loop check (M11) that compares shaft turns against simulated ground; D03, D06, D29, D33 and D35 were re-expressed against the commanded target, which now includes the ledger's trim.
 
 ### Design record
@@ -501,6 +512,7 @@ Governing principle, agreed with the user: **a gap in the field is a permanent d
 - Calibration run: the request is level-triggered (survives lost packets without an acknowledgement protocol); it bypasses the ground-speed interlock because it's a stationary job and the seeder may be off, but is refused while the machine moves; tractor loss aborts it; a short press can't stop it (that would spoil the weighing). The dispenser starts a run only on a request it saw go from 0 to 1, so it never restarts one by itself after its own reboot, a link gap or a clog — the tractor shows `PRZERWANA` instead of sitting at 0 %.
 - Clog alarm (agreed with the user): clog = shaft under 1/3 of the commanded speed for 1.5 s; the alarm covers any screen with the buzzer; `OK` → `Anuluj` (preselected, resumes metering) / `Odetkaj` (4 s reverse/forward sequence, no success check). Commands are counters repeated in every packet, acted on once, ignored right after a link gap or tractor reboot. A press counts only if its screen was already showing for the whole press, so an alarm appearing mid-press can't be acknowledged blind.
 - Tramline switch (agreed with the user): the machine is usually used without tramlines, so the switch starts off; flipping it saves straight away and never resets the pass number.
+- Blower alarm switch (added 25 September 2026, asked for by the user to test a stationary machine with the wheel turned by hand and no fan running): screen 21. Unlike every other switch it is **never stored** — each power-up starts with the alarm on. An alarm switched off in the yard must not follow the machine into the field, where a stopped fan ruins the pass with nothing to show for it. The dispenser never reads the turbine, so the alarm is a tractor matter only.
 
 #### Dispenser (§7)
 

@@ -46,6 +46,7 @@ enum class Screen : uint8_t {
     SeedCalibRun,     // driving the measured distance, screen 18
     SeedCalibResult,  // the measured value, or why there isn't one, screen 19
     Settings,         // everything stored, and the USB export, screen 20
+    Blower,           // the blower alarm switch, screen 21
 };
 
 // What is actually on the display. One Screen can show as several Views
@@ -74,6 +75,7 @@ enum class View : uint8_t {
     SeedCalibRun,
     SeedCalibResult,
     Settings,
+    Blower,
 };
 
 enum class MenuItem : uint8_t {
@@ -83,12 +85,14 @@ enum class MenuItem : uint8_t {
     Sciezki    = 3,
     Nasiona    = 4,
     Ustawienia = 5,
-    Count      = 6,
+    Dmuchawa   = 6,
+    Count      = 7,
 };
 
 // More items than rows, so the menu scrolls: four are drawn from menuTop, which
 // follows the cursor.
-static const char *const MENU_LABELS[] = {"Praca", "Dawka", "Kalibracja", "Sciezki", "Nasiona", "Ustawienia"};
+static const char *const MENU_LABELS[] = {"Praca", "Dawka", "Kalibracja", "Sciezki", "Nasiona", "Ustawienia",
+                                          "Dmuchawa"};
 static constexpr uint8_t MENU_VISIBLE_ROWS = 4;
 
 // What can take over the work screen. LinkLost is the exception: it is a letter
@@ -133,6 +137,13 @@ static uint8_t tramlineNumber = 0;
 // not lose the pass. Stored in NVS, written only when it is flipped.
 static bool    tramlinesEnabled = false;
 static uint8_t tramlineCursor   = 0;      // screen 15: 0 = the switch, 1 = ZAPISZ
+
+// The blower alarm can be switched off for testing a stationary machine, where
+// the wheel is turned by hand and no fan runs. Never stored, on purpose: every
+// power-up starts with it on, so an alarm switched off in the yard cannot follow
+// the machine into the field, where a stopped fan ruins the pass unnoticed.
+static bool    blowerAlarmEnabled = true;
+static uint8_t blowerCursor       = 0;    // screen 21: 0 = the switch, 1 = ZAPISZ
 
 // Distance covered between two wheel pulses, one value per seed-size gear: the
 // pin-27 sensor is on the metering drive, so it turns at a different rate to
@@ -440,6 +451,10 @@ static void handleMenu(ButtonEvent event)
                 settingsCursor = 0;   // cursor starts on the export
                 settingsSentMs = 0;
                 break;
+            case MenuItem::Dmuchawa:
+                screen = Screen::Blower;
+                blowerCursor = 0;     // cursor starts on the switch
+                break;
             default:
                 break;
         }
@@ -468,6 +483,21 @@ static void handleTramlines(ButtonEvent event)
         if (tramlineCursor == 0) {
             tramlinesEnabled = !tramlinesEnabled;
             prefs.putBool("tram_on", tramlinesEnabled);
+        } else {
+            screen = Screen::Menu;
+        }
+    }
+}
+
+// Screen 21: works like screen 15, except that the switch is not stored - see
+// blowerAlarmEnabled.
+static void handleBlower(ButtonEvent event)
+{
+    if (event == ButtonEvent::Short) {
+        blowerCursor = (blowerCursor + 1) % 2;
+    } else if (event == ButtonEvent::Long) {
+        if (blowerCursor == 0) {
+            blowerAlarmEnabled = !blowerAlarmEnabled;
         } else {
             screen = Screen::Menu;
         }
@@ -765,6 +795,7 @@ static void handleView(View view, ButtonEvent event)
         case View::EditDose:
         case View::EditCalibration:   handleEdit(event);          break;
         case View::Tramlines:         handleTramlines(event);     break;
+        case View::Blower:            handleBlower(event);        break;
         case View::Seeds:             handleSeeds(event);         break;
         case View::SeedCalibAsk:      handleSeedCalibAsk(event);  break;
         case View::SeedCalibRun:      handleSeedCalibRun(event);  break;
@@ -838,8 +869,10 @@ static void updateFaults(uint32_t now)
     // it goes quiet, the last thing it said is no evidence about the fan (the
     // same rule the dispenser fault below follows). The condition also has to
     // hold for TURBINE_ALARM_DELAY_MS, or moving off before the fan is up to
-    // speed would beep every time.
-    bool fanStopped = links.isAlive(NodeId::Seeder) && seederData.wheelTurning &&
+    // speed would beep every time. Switched off on screen 21 it never fires, and
+    // switching it back on starts the delay afresh.
+    bool fanStopped = blowerAlarmEnabled &&
+                      links.isAlive(NodeId::Seeder) && seederData.wheelTurning &&
                       seederData.turbineRPM < TURBINE_RUNNING_MIN_RPM;
     if (fanStopped) {
         if (turbineBadSinceMs == 0) turbineBadSinceMs = now;
@@ -933,6 +966,7 @@ static View currentView()
         case Screen::SeedCalibRun:    return View::SeedCalibRun;
         case Screen::SeedCalibResult: return View::SeedCalibResult;
         case Screen::Settings:        return View::Settings;
+        case Screen::Blower:          return View::Blower;
         case Screen::CalibConfirm:    return View::CalibConfirm;
         case Screen::CalibRunning:
             if (calibrationInterrupted)            return View::CalibInterrupted;
@@ -1373,21 +1407,23 @@ static void drawEdit()
     oled.print("ZAPISZ");
 }
 
-// Screen 15: the tramline switch. The value is stored the moment it is
-// flipped, so ZAPISZ only leaves the screen.
-static void drawTramlines()
+// Screens 15 and 21: a title, the switch (cursor 0) and ZAPISZ (cursor 1). The
+// switch takes effect the moment it is flipped, so ZAPISZ only leaves the
+// screen. note, if any, goes bottom left: at most 9 characters, so it ends
+// before the ZAPISZ field.
+static void drawSwitchScreen(const char *title, bool on, uint8_t switchCursor, const char *note)
 {
     oled.setTextColor(WHITE);
     oled.setTextSize(1);
     oled.setCursor(0, 0);
-    oled.print("SCIEZKI");
+    oled.print(title);
 
-    const char *value = tramlinesEnabled ? "WL." : "WYL.";
+    const char *value = on ? "WL." : "WYL.";
     const int16_t charWidth = 18;   // text size 3
     int16_t length = (int16_t)strlen(value);
     int16_t x = (SCREEN_WIDTH - charWidth * length) / 2;
 
-    if (tramlineCursor == 0) {
+    if (switchCursor == 0) {
         oled.fillRect(x - 3, 14, charWidth * length + 6, 28, WHITE);
         oled.setTextColor(BLACK);
     } else {
@@ -1397,9 +1433,15 @@ static void drawTramlines()
     oled.setCursor(x, 17);
     oled.print(value);
 
-    // The bottom-right field sits exactly where the editors draw ZAPISZ.
     oled.setTextSize(1);
-    if (tramlineCursor == 1) {
+    if (note != nullptr) {
+        oled.setTextColor(WHITE);
+        oled.setCursor(0, 52);
+        oled.print(note);
+    }
+
+    // The bottom-right field sits exactly where the editors draw ZAPISZ.
+    if (switchCursor == 1) {
         oled.fillRect(62, 50, 62, 12, WHITE);
         oled.setTextColor(BLACK);
     } else {
@@ -1407,6 +1449,20 @@ static void drawTramlines()
     }
     oled.setCursor(70, 52);
     oled.print("ZAPISZ");
+}
+
+// Screen 15: the tramline switch, stored the moment it is flipped.
+static void drawTramlines()
+{
+    drawSwitchScreen("SCIEZKI", tramlinesEnabled, tramlineCursor, nullptr);
+}
+
+// Screen 21: the blower alarm switch. Off, it says for how long - it is back on
+// at the next power-up.
+static void drawBlower()
+{
+    drawSwitchScreen("ALARM DMUCHAWY", blowerAlarmEnabled, blowerCursor,
+                     blowerAlarmEnabled ? nullptr : "do resetu");
 }
 
 static void drawCalibConfirm()
@@ -1549,6 +1605,7 @@ static void redraw()
         case View::EditDose:
         case View::EditCalibration:   drawEdit();             break;
         case View::Tramlines:         drawTramlines();        break;
+        case View::Blower:            drawBlower();           break;
         case View::Seeds:             drawSeeds();            break;
         case View::SeedCalibAsk:      drawSeedCalibAsk();     break;
         case View::SeedCalibRun:      drawSeedCalibRun();     break;
