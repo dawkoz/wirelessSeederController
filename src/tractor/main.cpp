@@ -1304,8 +1304,13 @@ static void drawWork()
     if (tramlinesEnabled) {
         oled.print("Przejazd:");
 
-        oled.setTextSize(4);
-        oled.setCursor(86, 30);
+        // Same size as the rest of the screen, on the same row as the label.
+        // It used to be drawn at text size 4 from (86, 30), which reaches down
+        // to y = 57 - into the bottom row, where it shared pixels with the
+        // animation marker (x 93-102, y 51-56) whenever tramlines were on and
+        // the auger was turning. The screen mockups in CLAUDE.md could not show
+        // that, because they draw every size at one character per cell.
+        oled.setCursor(96, 34);
         oled.print(tramlineNumber + 1);
     } else {
         // The pass number would be meaningless: the relay can never come on.
