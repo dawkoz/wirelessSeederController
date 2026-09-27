@@ -12,6 +12,17 @@
 #include "machine_settings.h"
 #include "espnow_protocol.h"
 
+// ===========================================================================
+// TEMPORARY - button debugging on serial, at SERIAL_BAUD. 1 = on, 0 = off:
+// every "#if BUTTON_DEBUG" block then compiles to nothing and the firmware is
+// exactly the production one. Can also be set from platformio.ini with
+// -D BUTTON_DEBUG=0. Search for BUTTON_DEBUG to delete the blocks once the
+// button is settled. Must be 0 before the tractor goes to the field.
+// ===========================================================================
+#ifndef BUTTON_DEBUG
+#define BUTTON_DEBUG 0
+#endif
+
 // Tractor module. Operator interface: OLED, one button, three LEDs, buzzer.
 // Owns the tramline selection and the dispenser settings, and broadcasts them.
 
@@ -318,14 +329,23 @@ static void sendCommand(uint32_t now)
 // task - never by loop(). loop() cannot see the pin while it redraws (~30 ms a
 // frame, every 200 ms on the live screens and after every press), and a button
 // read from loop() lost quick taps there and merged fast repeated ones into one.
-// The callback does only the part that has to keep time - debounce, and short
-// or long - and queues the press with the moment it began. Everything a press
-// does happens in loop(), the same split as OnDataRecv.
+// The callback does only the part that has to keep time - when a press starts
+// and ends, short or long - and queues the press with the moment it began.
+// Everything a press does happens in loop(), the same split as OnDataRecv.
+//
+// The rules are listed with the constants in machine_settings.h. The shape of
+// them: a press starts quickly (BUTTON_PRESS_CONFIRM_MS) but ends slowly
+// (BUTTON_RELEASE_CONFIRM_MS), so the switch bouncing or sparking under a
+// finger never splits one press into two; and a press starting within
+// BUTTON_MIN_GAP_MS of the last release is that release still bouncing, so it
+// is ignored whole. The gap is timed from the release, not from the previous
+// click: a long click is sent while the finger is still down, and a bounce when
+// it finally lets go, more than BUTTON_MIN_GAP_MS later, would otherwise click
+// again.
 //
 // A level, not an edge: a pin-change interrupt fires on every bounce and on
 // every spike picked up by the cable, and a spike taken as a press on the work
-// screen would move the tramline pass unseen. A spike is gone long before
-// BUTTON_DEBOUNCE_MS of samples agree.
+// screen would move the tramline pass unseen.
 //
 // A long press fires the moment the hold time is reached, while the button is
 // still down, so the operator gets feedback without having to watch the
@@ -336,8 +356,9 @@ struct ButtonPress {
     uint32_t    startMs;   // when the finger went down, to within one sample
 };
 
-static constexpr uint32_t BUTTON_DEBOUNCE_SAMPLES = BUTTON_DEBOUNCE_MS / BUTTON_SAMPLE_MS;
-static constexpr uint8_t  BUTTON_QUEUE_SIZE       = 8;
+static constexpr uint32_t BUTTON_PRESS_SAMPLES   = BUTTON_PRESS_CONFIRM_MS / BUTTON_SAMPLE_MS;
+static constexpr uint32_t BUTTON_RELEASE_SAMPLES = BUTTON_RELEASE_CONFIRM_MS / BUTTON_SAMPLE_MS;
+static constexpr uint8_t  BUTTON_QUEUE_SIZE      = 8;
 
 // Shared between the timer task and loop(): only ever touched under buttonLock.
 static ButtonPress  buttonQueue[BUTTON_QUEUE_SIZE];
@@ -346,13 +367,132 @@ static uint8_t      buttonQueueCount = 0;
 static portMUX_TYPE buttonLock = portMUX_INITIALIZER_UNLOCKED;
 
 // The sampler's own state: read and written by buttonSample() alone.
-static bool     sampledDown     = false;   // the debounced level, true = pressed
-static uint32_t sampledRun      = 0;       // samples in a row that disagree with it
-static uint32_t sampledRunStart = 0;       // when that run of samples began
-static uint32_t sampledPressMs  = 0;       // when the current press began
-static bool     sampledLongSent = false;
+static bool     sampledDown      = false;   // a press is in progress
+static uint32_t sampledRun       = 0;       // samples in a row against that: closed ones between
+                                            // presses, open ones during a press
+static uint32_t sampledRunStart  = 0;       // when that run of samples began
+static uint32_t sampledPressMs   = 0;       // when the current press began
+static uint32_t sampledReleaseMs = 0;       // when the finger last let go, of any press
+static bool     sampledTooSoon   = false;   // the current press began inside BUTTON_MIN_GAP_MS of that
+static bool     sampledLongSent  = false;
 
 static esp_timer_handle_t buttonTimer = nullptr;
+
+#if BUTTON_DEBUG
+// ---- BUTTON_DEBUG begin: what the sampler saw and decided -----------------
+// Recorded by the timer task and printed by loop(): printing from the timer
+// task would stall the very sampling it is meant to show. Each record is made
+// before the press it explains is queued, so its line always comes out before
+// loop()'s line about that press. Every time is millis().
+enum class ButtonDebugKind : uint8_t {
+    Blip,         // contact too short to start a press    a = when it began, b = how long
+    PressStart,   // a press confirmed                     a = when it began, b = ms since the last let-go
+    Spark,        // an opening too short to end a press   a = when it began, b = how long
+    Release,      // a press confirmed over                a = when the finger let go, b = how long it was held
+    Long,         // held for BUTTON_LONG_PRESS_MS         a = when the press began
+};
+
+struct ButtonDebugRecord {
+    ButtonDebugKind kind;
+    uint8_t         outcome;   // PressStart: 1 = too soon. Release: 0 = short sent, 1 = it was a long
+                               // press, 2 = too soon. Long: 0 = sent, 1 = too soon, not sent.
+    uint32_t        ms;        // the sample that decided it
+    uint32_t        a;
+    uint32_t        b;
+};
+
+static constexpr uint8_t BUTTON_DEBUG_QUEUE_SIZE = 32;
+static ButtonDebugRecord buttonDebugQueue[BUTTON_DEBUG_QUEUE_SIZE];   // all three under buttonLock
+static uint8_t           buttonDebugFirst = 0;
+static uint8_t           buttonDebugCount = 0;
+static uint32_t          buttonDebugLost  = 0;
+static bool              debugLongIgnoredShown = false;   // the sampler's own: one "too soon" long line per press
+
+static void debugButton(ButtonDebugKind kind, uint8_t outcome, uint32_t ms, uint32_t a, uint32_t b)
+{
+    portENTER_CRITICAL(&buttonLock);
+    if (buttonDebugCount < BUTTON_DEBUG_QUEUE_SIZE) {
+        ButtonDebugRecord &r = buttonDebugQueue[(buttonDebugFirst + buttonDebugCount) % BUTTON_DEBUG_QUEUE_SIZE];
+        r.kind    = kind;
+        r.outcome = outcome;
+        r.ms      = ms;
+        r.a       = a;
+        r.b       = b;
+        buttonDebugCount++;
+    } else {
+        buttonDebugLost++;
+    }
+    portEXIT_CRITICAL(&buttonLock);
+}
+
+static const char *const VIEW_DEBUG_NAMES[] = {
+    "Menu", "Work", "WorkFault", "EditDose", "EditCalibration", "Tramlines", "CalibConfirm",
+    "CalibProgress", "CalibDone", "CalibRefused", "CalibNoDispenser", "CalibInterrupted",
+    "ClogAlert", "ClogChoice", "Unclogging", "Seeds", "SeedCalibAsk", "SeedCalibRun",
+    "SeedCalibResult", "Settings", "Blower",
+};
+static_assert(sizeof(VIEW_DEBUG_NAMES) / sizeof(VIEW_DEBUG_NAMES[0]) == (size_t)View::Blower + 1,
+              "VIEW_DEBUG_NAMES must name every View, in the enum's order");
+
+static const char *viewDebugName(View v)
+{
+    return VIEW_DEBUG_NAMES[(uint8_t)v];
+}
+
+// Prints and empties the sampler's records. Called by loop() every iteration,
+// and by takeButtonEvent() before it says what it did with a press.
+static void printButtonDebug()
+{
+    for (;;) {
+        ButtonDebugRecord r    = {ButtonDebugKind::Blip, 0, 0, 0, 0};
+        bool              have = false;
+        uint32_t          lost = 0;
+
+        portENTER_CRITICAL(&buttonLock);
+        if (buttonDebugCount > 0) {
+            r = buttonDebugQueue[buttonDebugFirst];
+            buttonDebugFirst = (uint8_t)((buttonDebugFirst + 1) % BUTTON_DEBUG_QUEUE_SIZE);
+            buttonDebugCount--;
+            have = true;
+        }
+        lost            = buttonDebugLost;
+        buttonDebugLost = 0;
+        portEXIT_CRITICAL(&buttonLock);
+
+        if (lost != 0) Serial.printf("[btn        ] %lu lines lost, the debug queue was full\n", (unsigned long)lost);
+        if (!have) return;
+
+        unsigned long t = r.ms, a = r.a, b = r.b;
+        switch (r.kind) {
+            case ButtonDebugKind::Blip:
+                Serial.printf("[btn %7lu] blip     contact at %lu for %lu ms - too short for a press\n", t, a, b);
+                break;
+            case ButtonDebugKind::PressStart:
+                if (r.outcome != 0) {
+                    Serial.printf("[btn %7lu] press    began %lu, %lu ms after the last let-go -> TOO SOON (needs %lu), ignored whole\n",
+                                  t, a, b, (unsigned long)BUTTON_MIN_GAP_MS);
+                } else {
+                    Serial.printf("[btn %7lu] press    began %lu, %lu ms after the last let-go\n", t, a, b);
+                }
+                break;
+            case ButtonDebugKind::Spark:
+                Serial.printf("[btn %7lu] spark    open at %lu for %lu ms - the press goes on\n", t, a, b);
+                break;
+            case ButtonDebugKind::Release:
+                Serial.printf("[btn %7lu] let go   at %lu, held %lu ms -> %s\n", t, a, b,
+                              r.outcome == 0 ? "SHORT sent to loop" :
+                              r.outcome == 1 ? "nothing, it was a long press" :
+                                               "nothing, the press was too soon");
+                break;
+            case ButtonDebugKind::Long:
+                Serial.printf("[btn %7lu] long     press began %lu, held %lu ms -> %s\n", t, a, t - a,
+                              r.outcome == 0 ? "LONG sent to loop" : "not sent, the press was too soon");
+                break;
+        }
+    }
+}
+// ---- BUTTON_DEBUG end ---------------------------------------------------------
+#endif
 
 static void queueButtonPress(ButtonEvent type, uint32_t startMs)
 {
@@ -376,28 +516,66 @@ static void buttonSample(void *)
     bool     down = (digitalRead(BUTTON_PIN) == LOW);
 
     if (down == sampledDown) {
-        sampledRun = 0;                        // bounce or a spike: the level came back
+#if BUTTON_DEBUG
+        // A run that came back before it counted: an opening during a press,
+        // or contact between presses, each too short to change anything.
+        if (sampledRun > 0) {
+            debugButton(sampledDown ? ButtonDebugKind::Spark : ButtonDebugKind::Blip, 0,
+                        now, sampledRunStart, now - sampledRunStart);
+        }
+#endif
+        sampledRun = 0;                        // bounce, a spark or a spike: the level came back
     } else {
         if (sampledRun == 0) sampledRunStart = now;
         sampledRun++;
-        if (sampledRun >= BUTTON_DEBOUNCE_SAMPLES) {
+        // Quick to start a press, slow to end one.
+        if (sampledRun >= (down ? BUTTON_PRESS_SAMPLES : BUTTON_RELEASE_SAMPLES)) {
             sampledDown = down;
             sampledRun  = 0;
             if (down) {
-                // Where the finger actually pressed, not where the debounce
+                // Where the finger actually pressed, not where the confirmation
                 // finished: the button rule compares this with the view.
                 sampledPressMs  = sampledRunStart;
                 sampledLongSent = false;
-            } else if (!sampledLongSent) {
-                queueButtonPress(ButtonEvent::Short, sampledPressMs);
+                sampledTooSoon  = (sampledPressMs - sampledReleaseMs < BUTTON_MIN_GAP_MS);
+#if BUTTON_DEBUG
+                debugLongIgnoredShown = false;
+                debugButton(ButtonDebugKind::PressStart, sampledTooSoon ? 1 : 0,
+                            now, sampledPressMs, sampledPressMs - sampledReleaseMs);
+#endif
+            } else {
+                sampledReleaseMs = sampledRunStart;   // where the finger let go
+#if BUTTON_DEBUG
+                debugButton(ButtonDebugKind::Release, sampledLongSent ? 1 : (sampledTooSoon ? 2 : 0),
+                            now, sampledReleaseMs, sampledReleaseMs - sampledPressMs);
+#endif
+                if (!sampledLongSent && !sampledTooSoon) {
+                    queueButtonPress(ButtonEvent::Short, sampledPressMs);
+                }
             }
         }
     }
 
-    if (sampledDown && !sampledLongSent && (now - sampledPressMs >= BUTTON_LONG_PRESS_MS)) {
+    // Only on a closed sample: an open one may be the press ending, and a press
+    // that ends before BUTTON_LONG_PRESS_MS is a short one.
+    if (sampledDown && down && !sampledLongSent && !sampledTooSoon &&
+        (now - sampledPressMs >= BUTTON_LONG_PRESS_MS)) {
         sampledLongSent = true;                // the release after it is swallowed
+#if BUTTON_DEBUG
+        debugButton(ButtonDebugKind::Long, 0, now, sampledPressMs, 0);
+#endif
         queueButtonPress(ButtonEvent::Long, sampledPressMs);
     }
+
+#if BUTTON_DEBUG
+    // Held long enough for a long press, but the press was too soon: said once,
+    // so the log shows the long press that did not happen.
+    if (sampledDown && down && sampledTooSoon && !debugLongIgnoredShown &&
+        (now - sampledPressMs >= BUTTON_LONG_PRESS_MS)) {
+        debugLongIgnoredShown = true;
+        debugButton(ButtonDebugKind::Long, 1, now, sampledPressMs, 0);
+    }
+#endif
 }
 
 static void startButtonSampling()
@@ -435,8 +613,22 @@ static ButtonEvent takeButtonEvent()
     portEXIT_CRITICAL(&buttonLock);
 
     if (press.type == ButtonEvent::None) return ButtonEvent::None;
-    if ((int32_t)(press.startMs - shownSinceMs) < (int32_t)BUTTON_SCREEN_SETTLE_MS) return ButtonEvent::None;
-    return press.type;
+    bool counts = (int32_t)(press.startMs - shownSinceMs) >= (int32_t)BUTTON_SCREEN_SETTLE_MS;
+
+#if BUTTON_DEBUG
+    printButtonDebug();   // the sampler's line about this press comes first
+    Serial.printf("[btn %7lu] loop     takes %s (began %lu) on %s, up %ld ms when it began -> ",
+                  (unsigned long)millis(), press.type == ButtonEvent::Long ? "LONG" : "SHORT",
+                  (unsigned long)press.startMs, viewDebugName(shownView),
+                  (long)(int32_t)(press.startMs - shownSinceMs));
+    if (counts) {
+        Serial.println("COUNTED");
+    } else {
+        Serial.printf("IGNORED, screen rule: it must be up %lu ms first\n", (unsigned long)BUTTON_SCREEN_SETTLE_MS);
+    }
+#endif
+
+    return counts ? press.type : ButtonEvent::None;
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,7 +1891,21 @@ static void redraw()
 
 void setup()
 {
+#if BUTTON_DEBUG
+    // Without a buffer every print waits for the 128-byte UART FIFO, so a few
+    // debug lines would hold loop() up for tens of ms - and shift the screen
+    // rule's timing, which is part of what the log is meant to show.
+    Serial.setTxBufferSize(4096);
+#endif
     Serial.begin(SERIAL_BAUD);
+#if BUTTON_DEBUG
+    Serial.printf("\nBUTTON_DEBUG on - times in ms since boot. Sample every %lu, a press after %lu of contact, "
+                  "let go after %lu without, long at %lu, next press at least %lu after a let-go, "
+                  "screen up %lu before a press counts\n",
+                  (unsigned long)BUTTON_SAMPLE_MS, (unsigned long)BUTTON_PRESS_CONFIRM_MS,
+                  (unsigned long)BUTTON_RELEASE_CONFIRM_MS, (unsigned long)BUTTON_LONG_PRESS_MS,
+                  (unsigned long)BUTTON_MIN_GAP_MS, (unsigned long)BUTTON_SCREEN_SETTLE_MS);
+#endif
 
     // The internal pull-up stays on alongside the 470 R one: should that
     // resistor ever come off, the button still works, just with the old
@@ -1803,11 +2009,17 @@ void loop()
         shownSinceMs = now;
         displayDirty = true;
         if (v == View::ClogChoice) clogChoiceIndex = 0;   // Anuluj preselected every time it appears
+#if BUTTON_DEBUG
+        Serial.printf("[btn %7lu] screen   -> %s\n", (unsigned long)now, viewDebugName(v));
+#endif
     }
 
     // 5. Button, dispatched on the current view. At most one press per
     //    iteration: if it changes the view, step 4 sees that before the next
     //    queued press is judged.
+#if BUTTON_DEBUG
+    printButtonDebug();
+#endif
     ButtonEvent event = takeButtonEvent();
     if (event != ButtonEvent::None) {
         handleView(v, event);
