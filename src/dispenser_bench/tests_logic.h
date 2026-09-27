@@ -6,6 +6,7 @@
 #include "espnow_protocol.h"
 #include "../dispenser/dispenser_logic.h"
 #include "bench_report.h"
+#include "bench_wheel.h"
 
 // ---------------------------------------------------------------------------
 // D tests: the decision logic on its own, driven with made-up time, encoder
@@ -31,7 +32,7 @@ struct DHarness {
     // it reports so that the dispenser's distance ledger and its rate maths see
     // the same ground. mmPerPulse is what the simulated tractor sends.
     double   pulseCarry = 0.0;
-    uint16_t mmPerPulse = WHEEL_MM_PER_PULSE_DEFAULT;
+    uint16_t mmPerPulse = BENCH_WHEEL_MM_PER_PULSE;
 
     bool            seederAlive   = false;
     bool            haveTelemetry = false;
@@ -69,7 +70,7 @@ static void dFresh(DHarness &h)
     h.edgeCarry = 0.0;
     h.shaftRPM  = 0.0;
     h.pulseCarry = 0.0;
-    h.mmPerPulse = WHEEL_MM_PER_PULSE_DEFAULT;
+    h.mmPerPulse = BENCH_WHEEL_MM_PER_PULSE;
 
     h.seederAlive   = false;
     h.haveTelemetry = false;

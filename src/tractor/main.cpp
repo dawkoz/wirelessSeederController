@@ -322,6 +322,133 @@ static void sendCommand(uint32_t now)
 }
 
 // ---------------------------------------------------------------------------
+// Button debugging - TEMPORARY, compiled only with BUTTON_DEBUG 1
+// ---------------------------------------------------------------------------
+
+// Everything in this section exists only to print. The button code below
+// never reads any of it: with BUTTON_DEBUG 0 the section, the one-line hooks
+// that feed it and the prints all disappear, and the button works exactly the
+// same, only silently. It has its own lock, so it does not even share that.
+//
+// What the sampler saw and decided is recorded by the timer task and printed
+// by loop(): printing from the timer task would stall the very sampling it is
+// meant to show. Each record is made before the press it explains is queued,
+// so its line always comes out before loop()'s line about that press. Every
+// time is millis().
+#if BUTTON_DEBUG
+static portMUX_TYPE buttonDebugLock = portMUX_INITIALIZER_UNLOCKED;
+
+enum class ButtonDebugKind : uint8_t {
+    Blip,         // contact too short to start a press    a = when it began, b = how long
+    PressStart,   // a press confirmed                     a = when it began, b = ms since the last let-go
+    Spark,        // an opening too short to end a press   a = when it began, b = how long
+    Release,      // a press confirmed over                a = when the finger let go, b = how long it was held
+    Long,         // held for BUTTON_LONG_PRESS_MS         a = when the press began
+};
+
+struct ButtonDebugRecord {
+    ButtonDebugKind kind;
+    uint8_t         outcome;   // PressStart: 1 = too soon. Release: 0 = short sent, 1 = it was a long
+                               // press, 2 = too soon. Long: 0 = sent, 1 = too soon, not sent.
+    uint32_t        ms;        // the sample that decided it
+    uint32_t        a;
+    uint32_t        b;
+};
+
+static constexpr uint8_t BUTTON_DEBUG_QUEUE_SIZE = 32;
+static ButtonDebugRecord buttonDebugQueue[BUTTON_DEBUG_QUEUE_SIZE];   // all three under buttonDebugLock
+static uint8_t           buttonDebugFirst = 0;
+static uint8_t           buttonDebugCount = 0;
+static uint32_t          buttonDebugLost  = 0;
+static bool              debugLongIgnoredShown = false;   // the sampler's own: one "too soon" long line per press
+
+static void debugButton(ButtonDebugKind kind, uint8_t outcome, uint32_t ms, uint32_t a, uint32_t b)
+{
+    portENTER_CRITICAL(&buttonDebugLock);
+    if (buttonDebugCount < BUTTON_DEBUG_QUEUE_SIZE) {
+        ButtonDebugRecord &r = buttonDebugQueue[(buttonDebugFirst + buttonDebugCount) % BUTTON_DEBUG_QUEUE_SIZE];
+        r.kind    = kind;
+        r.outcome = outcome;
+        r.ms      = ms;
+        r.a       = a;
+        r.b       = b;
+        buttonDebugCount++;
+    } else {
+        buttonDebugLost++;
+    }
+    portEXIT_CRITICAL(&buttonDebugLock);
+}
+
+static const char *const VIEW_DEBUG_NAMES[] = {
+    "Menu", "Work", "WorkFault", "EditDose", "EditCalibration", "Tramlines", "CalibConfirm",
+    "CalibProgress", "CalibDone", "CalibRefused", "CalibNoDispenser", "CalibInterrupted",
+    "ClogAlert", "ClogChoice", "Unclogging", "Seeds", "SeedCalibAsk", "SeedCalibRun",
+    "SeedCalibResult", "Settings", "Blower",
+};
+static_assert(sizeof(VIEW_DEBUG_NAMES) / sizeof(VIEW_DEBUG_NAMES[0]) == (size_t)View::Blower + 1,
+              "VIEW_DEBUG_NAMES must name every View, in the enum's order");
+
+static const char *viewDebugName(View v)
+{
+    return VIEW_DEBUG_NAMES[(uint8_t)v];
+}
+
+// Prints and empties the sampler's records. Called by loop() every iteration,
+// and by takeButtonEvent() before it says what it did with a press.
+static void printButtonDebug()
+{
+    for (;;) {
+        ButtonDebugRecord r    = {ButtonDebugKind::Blip, 0, 0, 0, 0};
+        bool              have = false;
+        uint32_t          lost = 0;
+
+        portENTER_CRITICAL(&buttonDebugLock);
+        if (buttonDebugCount > 0) {
+            r = buttonDebugQueue[buttonDebugFirst];
+            buttonDebugFirst = (uint8_t)((buttonDebugFirst + 1) % BUTTON_DEBUG_QUEUE_SIZE);
+            buttonDebugCount--;
+            have = true;
+        }
+        lost            = buttonDebugLost;
+        buttonDebugLost = 0;
+        portEXIT_CRITICAL(&buttonDebugLock);
+
+        if (lost != 0) Serial.printf("[btn        ] %lu lines lost, the debug queue was full\n", (unsigned long)lost);
+        if (!have) return;
+
+        unsigned long t = r.ms, a = r.a, b = r.b;
+        switch (r.kind) {
+            case ButtonDebugKind::Blip:
+                Serial.printf("[btn %7lu] blip     contact at %lu for %lu ms - too short for a press\n", t, a, b);
+                break;
+            case ButtonDebugKind::PressStart:
+                if (r.outcome != 0) {
+                    Serial.printf("[btn %7lu] press    began %lu, %lu ms after the last let-go -> TOO SOON (needs %lu), ignored whole\n",
+                                  t, a, b, (unsigned long)BUTTON_MIN_GAP_MS);
+                } else {
+                    Serial.printf("[btn %7lu] press    began %lu, %lu ms after the last let-go\n", t, a, b);
+                }
+                break;
+            case ButtonDebugKind::Spark:
+                Serial.printf("[btn %7lu] spark    open at %lu for %lu ms - the press goes on\n", t, a, b);
+                break;
+            case ButtonDebugKind::Release:
+                Serial.printf("[btn %7lu] let go   at %lu, held %lu ms -> %s\n", t, a, b,
+                              r.outcome == 0 ? "SHORT sent to loop" :
+                              r.outcome == 1 ? "nothing, it was a long press" :
+                                               "nothing, the press was too soon");
+                break;
+            case ButtonDebugKind::Long:
+                Serial.printf("[btn %7lu] long     press began %lu, held %lu ms -> %s\n", t, a, t - a,
+                              r.outcome == 0 ? "LONG sent to loop" : "not sent, the press was too soon");
+                break;
+        }
+    }
+}
+// ---- end of button debugging ---------------------------------------------
+#endif
+
+// ---------------------------------------------------------------------------
 // Button
 // ---------------------------------------------------------------------------
 
@@ -377,122 +504,6 @@ static bool     sampledTooSoon   = false;   // the current press began inside BU
 static bool     sampledLongSent  = false;
 
 static esp_timer_handle_t buttonTimer = nullptr;
-
-#if BUTTON_DEBUG
-// ---- BUTTON_DEBUG begin: what the sampler saw and decided -----------------
-// Recorded by the timer task and printed by loop(): printing from the timer
-// task would stall the very sampling it is meant to show. Each record is made
-// before the press it explains is queued, so its line always comes out before
-// loop()'s line about that press. Every time is millis().
-enum class ButtonDebugKind : uint8_t {
-    Blip,         // contact too short to start a press    a = when it began, b = how long
-    PressStart,   // a press confirmed                     a = when it began, b = ms since the last let-go
-    Spark,        // an opening too short to end a press   a = when it began, b = how long
-    Release,      // a press confirmed over                a = when the finger let go, b = how long it was held
-    Long,         // held for BUTTON_LONG_PRESS_MS         a = when the press began
-};
-
-struct ButtonDebugRecord {
-    ButtonDebugKind kind;
-    uint8_t         outcome;   // PressStart: 1 = too soon. Release: 0 = short sent, 1 = it was a long
-                               // press, 2 = too soon. Long: 0 = sent, 1 = too soon, not sent.
-    uint32_t        ms;        // the sample that decided it
-    uint32_t        a;
-    uint32_t        b;
-};
-
-static constexpr uint8_t BUTTON_DEBUG_QUEUE_SIZE = 32;
-static ButtonDebugRecord buttonDebugQueue[BUTTON_DEBUG_QUEUE_SIZE];   // all three under buttonLock
-static uint8_t           buttonDebugFirst = 0;
-static uint8_t           buttonDebugCount = 0;
-static uint32_t          buttonDebugLost  = 0;
-static bool              debugLongIgnoredShown = false;   // the sampler's own: one "too soon" long line per press
-
-static void debugButton(ButtonDebugKind kind, uint8_t outcome, uint32_t ms, uint32_t a, uint32_t b)
-{
-    portENTER_CRITICAL(&buttonLock);
-    if (buttonDebugCount < BUTTON_DEBUG_QUEUE_SIZE) {
-        ButtonDebugRecord &r = buttonDebugQueue[(buttonDebugFirst + buttonDebugCount) % BUTTON_DEBUG_QUEUE_SIZE];
-        r.kind    = kind;
-        r.outcome = outcome;
-        r.ms      = ms;
-        r.a       = a;
-        r.b       = b;
-        buttonDebugCount++;
-    } else {
-        buttonDebugLost++;
-    }
-    portEXIT_CRITICAL(&buttonLock);
-}
-
-static const char *const VIEW_DEBUG_NAMES[] = {
-    "Menu", "Work", "WorkFault", "EditDose", "EditCalibration", "Tramlines", "CalibConfirm",
-    "CalibProgress", "CalibDone", "CalibRefused", "CalibNoDispenser", "CalibInterrupted",
-    "ClogAlert", "ClogChoice", "Unclogging", "Seeds", "SeedCalibAsk", "SeedCalibRun",
-    "SeedCalibResult", "Settings", "Blower",
-};
-static_assert(sizeof(VIEW_DEBUG_NAMES) / sizeof(VIEW_DEBUG_NAMES[0]) == (size_t)View::Blower + 1,
-              "VIEW_DEBUG_NAMES must name every View, in the enum's order");
-
-static const char *viewDebugName(View v)
-{
-    return VIEW_DEBUG_NAMES[(uint8_t)v];
-}
-
-// Prints and empties the sampler's records. Called by loop() every iteration,
-// and by takeButtonEvent() before it says what it did with a press.
-static void printButtonDebug()
-{
-    for (;;) {
-        ButtonDebugRecord r    = {ButtonDebugKind::Blip, 0, 0, 0, 0};
-        bool              have = false;
-        uint32_t          lost = 0;
-
-        portENTER_CRITICAL(&buttonLock);
-        if (buttonDebugCount > 0) {
-            r = buttonDebugQueue[buttonDebugFirst];
-            buttonDebugFirst = (uint8_t)((buttonDebugFirst + 1) % BUTTON_DEBUG_QUEUE_SIZE);
-            buttonDebugCount--;
-            have = true;
-        }
-        lost            = buttonDebugLost;
-        buttonDebugLost = 0;
-        portEXIT_CRITICAL(&buttonLock);
-
-        if (lost != 0) Serial.printf("[btn        ] %lu lines lost, the debug queue was full\n", (unsigned long)lost);
-        if (!have) return;
-
-        unsigned long t = r.ms, a = r.a, b = r.b;
-        switch (r.kind) {
-            case ButtonDebugKind::Blip:
-                Serial.printf("[btn %7lu] blip     contact at %lu for %lu ms - too short for a press\n", t, a, b);
-                break;
-            case ButtonDebugKind::PressStart:
-                if (r.outcome != 0) {
-                    Serial.printf("[btn %7lu] press    began %lu, %lu ms after the last let-go -> TOO SOON (needs %lu), ignored whole\n",
-                                  t, a, b, (unsigned long)BUTTON_MIN_GAP_MS);
-                } else {
-                    Serial.printf("[btn %7lu] press    began %lu, %lu ms after the last let-go\n", t, a, b);
-                }
-                break;
-            case ButtonDebugKind::Spark:
-                Serial.printf("[btn %7lu] spark    open at %lu for %lu ms - the press goes on\n", t, a, b);
-                break;
-            case ButtonDebugKind::Release:
-                Serial.printf("[btn %7lu] let go   at %lu, held %lu ms -> %s\n", t, a, b,
-                              r.outcome == 0 ? "SHORT sent to loop" :
-                              r.outcome == 1 ? "nothing, it was a long press" :
-                                               "nothing, the press was too soon");
-                break;
-            case ButtonDebugKind::Long:
-                Serial.printf("[btn %7lu] long     press began %lu, held %lu ms -> %s\n", t, a, t - a,
-                              r.outcome == 0 ? "LONG sent to loop" : "not sent, the press was too soon");
-                break;
-        }
-    }
-}
-// ---- BUTTON_DEBUG end ---------------------------------------------------------
-#endif
 
 static void queueButtonPress(ButtonEvent type, uint32_t startMs)
 {

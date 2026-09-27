@@ -42,7 +42,7 @@ static constexpr uint32_t LINK_TIMEOUT_MS = 1000; // a board silent this long co
 
 static constexpr uint8_t RELAY_PIN = 12;          // strapping pin: never add a pull-up to this line
 static constexpr uint8_t TURBINE_SENSOR_PIN = 14; // inductive sensor
-static constexpr uint8_t WHEEL_SENSOR_PIN = 27;   // Hall sensor on the ground wheel, before the seed-rate gearbox
+static constexpr uint8_t WHEEL_SENSOR_PIN = 27;   // Hall sensor on the metering drive (WHEEL_MAGNETS magnets)
 
 static constexpr uint8_t RELAY_ON = LOW; // the relay board is active LOW
 static constexpr uint8_t RELAY_OFF = HIGH;
@@ -56,20 +56,25 @@ static constexpr uint8_t RELAY_OFF = HIGH;
 // default below is only used until the first command arrives, and as the
 // fallback for a value outside the limits.
 // MEASURE: Nasiona -> Kalibracja on the tractor does it, once per seed size.
-static constexpr uint16_t WHEEL_MM_PER_PULSE_DEFAULT = 785; // 6 magnets, ratio 0.4, 600 mm wheel
+// A 600 mm wheel turns the metering drive about 0.4 of a turn per turn, so one
+// drive turn is ~4.71 m of ground, split between the magnets.
+static constexpr uint16_t WHEEL_MM_PER_PULSE_DEFAULT = 1571; // 3 magnets, ratio 0.4, 600 mm wheel
 static constexpr uint16_t WHEEL_MM_PER_PULSE_MIN = 100;
 static constexpr uint16_t WHEEL_MM_PER_PULSE_MAX = 5000;
 
-static constexpr uint8_t WHEEL_MAGNETS = 6;           // three more fitted to halve the gap between pulses
-static constexpr uint8_t WHEEL_AVERAGE_INTERVALS = 6; // speed is averaged over this many gaps between pulses
+// Magnets on the metering drive. Six were planned, to halve the distance per
+// pulse, but that close together the sensor could not tell one from the next
+// (27 September 2026), so the drive keeps its three.
+static constexpr uint8_t WHEEL_MAGNETS = 3;
+static constexpr uint8_t WHEEL_AVERAGE_INTERVALS = 3; // speed is averaged over this many gaps: one drive turn
 
 // The slowest speed this sensor still calls "moving". A pulse that has not
 // arrived within (distance per pulse / this) means the machine has stopped: at
 // any higher speed it would already be here. One number with a physical
-// meaning, in place of the old fixed 2 s timeout - which, on the metering drive
-// with 6 magnets, called a machine moving at 1.4 km/h stopped. The cost of
-// lowering it is that a real stop takes (distance per pulse / this) to notice:
-// 2.6 s at the default distance.
+// meaning, in place of the old fixed 2 s timeout - which, on the metering drive,
+// called a machine moving at 1.4 km/h stopped even with six magnets. The cost
+// of lowering it is that a real stop takes (distance per pulse / this) to
+// notice: 5.2 s at the default distance with three magnets.
 static constexpr uint16_t WHEEL_MIN_SPEED_MM_S = 300; // ~1.1 km/h
 
 static constexpr uint32_t WHEEL_MAX_SPEED_MM_S = 11000; // ~40 km/h, above any road speed
@@ -128,8 +133,10 @@ static constexpr uint8_t OLED_I2C_ADDRESS = 0x3C;
 // (CLAUDE.md, Design record -> Tractor UI).
 static constexpr uint32_t BUTTON_SAMPLE_MS = 5;
 // Two samples in a row, so a single spike on the line can never be a press.
-// 5 would start a press on any closed sample.
-static constexpr uint32_t BUTTON_PRESS_CONFIRM_MS = 10;
+// 5 would start a press on any closed sample. Keep it short: a quick tap on
+// this switch makes only 15-60 ms of contact - at 50, every tap under 50 ms
+// was thrown away as a "blip" (seen in the BUTTON_DEBUG log, 27 September 2026).
+static constexpr uint32_t BUTTON_PRESS_CONFIRM_MS = 50;
 // Must be longer than any opening the switch makes on its own: this one clicked
 // twice when openings of 20 ms already ended a press. At 50 ms a press lasts
 // through anything up to ~45 ms.

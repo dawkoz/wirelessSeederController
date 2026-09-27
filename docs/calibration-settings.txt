@@ -48,7 +48,8 @@ RECORDS - newest at the bottom
 
 --- EXAMPLE, these are the untouched first-boot values. Delete when you paste
 --- a real one. Date every block: the wheel values only mean anything for the
---- machine, wheel and magnets they were measured on.
+--- machine, wheel and magnets they were measured on. (The 785 below was the
+--- first-boot value for six magnets; with the three fitted it is 1571.)
 
 2026-09-18  factory defaults, nothing measured yet
 

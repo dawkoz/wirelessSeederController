@@ -5,6 +5,7 @@
 #include "machine_settings.h"
 #include "../seeder/wheel_speed.h"
 #include "bench_report.h"
+#include "bench_wheel.h"
 
 // ---------------------------------------------------------------------------
 // W tests: the seeder's ground-speed logic (src/seeder/wheel_speed.h), driven
@@ -13,10 +14,12 @@
 // bench carries it even though the code belongs to the other board.
 //
 // The numbers behind the rules: the sensor is on the metering drive, so one
-// pulse is about 0.8 m with 6 magnets. That is a pulse every 0.35 s at 8 km/h
-// but only every 1.4 s at 2 km/h, which is why "stopped" is a speed
+// pulse is about 1.6 m with the 3 magnets fitted. That is a pulse every 0.7 s
+// at 8 km/h but only every 2.8 s at 2 km/h, which is why "stopped" is a speed
 // (WHEEL_MIN_SPEED_MM_S) and not a fixed timeout, and why the average spans a
-// whole turn of the drive.
+// whole turn of the drive. The tests run at BENCH_WHEEL_MM_PER_PULSE, the
+// distance they were checked with: every rule scales with the distance, and
+// the magnet count comes from WHEEL_MAGNETS.
 // ---------------------------------------------------------------------------
 
 struct WHarness {
@@ -70,7 +73,7 @@ static uint64_t wStopUs(uint16_t mmPerPulse)
 
 static void runWheelTests()
 {
-    const uint16_t mm = WHEEL_MM_PER_PULSE_DEFAULT;
+    const uint16_t mm = BENCH_WHEEL_MM_PER_PULSE;
 
     Serial.println();
     Serial.println("--- W: ground speed from wheel pulses (no hardware) ---");
@@ -154,15 +157,22 @@ static void runWheelTests()
     }
 
     // W07 - magnets glued on by hand are not evenly spaced. Averaging whole
-    // turns is what cancels that, so the deviations here sum to one turn.
+    // turns is what cancels that, so the deviations here sum to one turn:
+    // +10 % and -10 % in pairs, and with an odd count the last magnet in its
+    // true place (3 magnets: 1.10, 0.90, 1.00).
     {
         WHarness h; wFresh(h);
-        const double dev[6] = {1.10, 0.90, 1.05, 0.95, 1.00, 1.00};
+        double dev[WHEEL_MAGNETS];
+        for (uint8_t i = 0; i < WHEEL_MAGNETS; i++) {
+            if (i % 2 == 1)                dev[i] = 0.90;
+            else if (i + 1 < WHEEL_MAGNETS) dev[i] = 1.10;
+            else                           dev[i] = 1.00;
+        }
         uint64_t base = wGapUs(mm, 2222);
         bool ok = true;
         uint16_t last = 0;
         for (int turn = 0; turn < 4; turn++) {
-            for (int i = 0; i < 6; i++) {
+            for (int i = 0; i < WHEEL_MAGNETS; i++) {
                 wAdvance(h, (uint64_t)(base * dev[i]));
                 wPulse(h);
                 if (turn >= 2) {

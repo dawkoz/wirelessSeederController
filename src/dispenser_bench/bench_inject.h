@@ -5,6 +5,7 @@
 #include "machine_settings.h"
 #include "espnow_protocol.h"
 #include "../dispenser/dispenser_io.h"
+#include "bench_wheel.h"
 
 // ---------------------------------------------------------------------------
 // The simulated seeder and tractor. Packets are built with the real structs
@@ -53,7 +54,7 @@ struct SimTractor {
     // value, so the two sides of the dispenser's distance ledger agree - as
     // they do on the machine, where the tractor sends the number both boards
     // meter with.
-    uint16_t wheelMmPerPulse  = WHEEL_MM_PER_PULSE_DEFAULT;
+    uint16_t wheelMmPerPulse  = BENCH_WHEEL_MM_PER_PULSE;
 
     // upTimeMs = bench time + this offset, so a test can make it go backwards
     // (a tractor reboot) by lowering it.
