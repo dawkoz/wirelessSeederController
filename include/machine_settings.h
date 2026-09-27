@@ -40,9 +40,13 @@ static constexpr uint32_t LINK_TIMEOUT_MS = 1000; // a board silent this long co
 
 // --- Pins -------------------------------------------------------------------
 
-static constexpr uint8_t RELAY_PIN = 12;          // strapping pin: never add a pull-up to this line
-static constexpr uint8_t TURBINE_SENSOR_PIN = 14; // inductive sensor
-static constexpr uint8_t WHEEL_SENSOR_PIN = 27;   // Hall sensor on the metering drive (WHEEL_MAGNETS magnets)
+// All three are plain GPIOs: no strapping role, nothing driven during boot,
+// an input with no pull-up or pull-down while in reset, and internal pull-ups
+// and interrupts once running. During reset the relay board's own input circuit
+// decides, so an active-LOW board stays off until setup() takes the pin.
+static constexpr uint8_t RELAY_PIN = 18;          // relay board input, active LOW
+static constexpr uint8_t TURBINE_SENSOR_PIN = 19; // inductive sensor
+static constexpr uint8_t WHEEL_SENSOR_PIN = 22;   // Hall sensor on the metering drive (WHEEL_MAGNETS magnets)
 
 static constexpr uint8_t RELAY_ON = LOW; // the relay board is active LOW
 static constexpr uint8_t RELAY_OFF = HIGH;
