@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_now.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <WiFi.h>
 #include <Preferences.h>
@@ -214,26 +215,15 @@ static bool     calibStartWatchRunning = false;
 static uint32_t calibStartWatchMs      = 0;
 
 // View tracking - also the reference for the button rule: a press counts only
-// if the view it started on was already showing BUTTON_SCREEN_SETTLE_MS
-// before the press began.
+// if the view it acts on was already showing BUTTON_SCREEN_SETTLE_MS before
+// the press began. shownSinceMs is when loop() first saw the current view.
 static View      shownView     = View::Menu;
 static FaultCode shownFault    = FaultCode::None;
 static uint32_t  shownSinceMs  = 0;
-static uint8_t   viewGeneration = 0;
 
 static uint32_t lastSendMs    = 0;
 static uint32_t lastDisplayMs = 0;
 static bool     displayDirty  = true;
-
-// Button debounce / press classification
-static bool     buttonStable   = false;   // true = pressed
-static bool     buttonFlicker  = false;
-static uint32_t lastDebounceMs = 0;
-static bool     buttonHeld     = false;
-static uint32_t buttonDownMs   = 0;
-static bool     longAlreadyFired = false;
-static uint8_t  pressGeneration = 0;      // viewGeneration when the press began
-static uint32_t pressStartMs    = 0;      // last raw change, i.e. when the finger actually pressed
 
 // ---------------------------------------------------------------------------
 // ESP-NOW
@@ -324,53 +314,129 @@ static void sendCommand(uint32_t now)
 // Button
 // ---------------------------------------------------------------------------
 
+// The button is sampled every BUTTON_SAMPLE_MS by an esp_timer, from the timer
+// task - never by loop(). loop() cannot see the pin while it redraws (~30 ms a
+// frame, every 200 ms on the live screens and after every press), and a button
+// read from loop() lost quick taps there and merged fast repeated ones into one.
+// The callback does only the part that has to keep time - debounce, and short
+// or long - and queues the press with the moment it began. Everything a press
+// does happens in loop(), the same split as OnDataRecv.
+//
+// A level, not an edge: a pin-change interrupt fires on every bounce and on
+// every spike picked up by the cable, and a spike taken as a press on the work
+// screen would move the tramline pass unseen. A spike is gone long before
+// BUTTON_DEBOUNCE_MS of samples agree.
+//
 // A long press fires the moment the hold time is reached, while the button is
 // still down, so the operator gets feedback without having to watch the
 // screen. The release that follows is swallowed.
-//
-// Button rule: a press counts only if the same view was showing for the whole
-// press. That covers both "the view changed while the button was held" and
-// "the press started just before a new view appeared" - without it, a press
-// that straddles a screen change would act on the screen it no longer sees.
-static bool pressCounts()
+
+struct ButtonPress {
+    ButtonEvent type;
+    uint32_t    startMs;   // when the finger went down, to within one sample
+};
+
+static constexpr uint32_t BUTTON_DEBOUNCE_SAMPLES = BUTTON_DEBOUNCE_MS / BUTTON_SAMPLE_MS;
+static constexpr uint8_t  BUTTON_QUEUE_SIZE       = 8;
+
+// Shared between the timer task and loop(): only ever touched under buttonLock.
+static ButtonPress  buttonQueue[BUTTON_QUEUE_SIZE];
+static uint8_t      buttonQueueFirst = 0;
+static uint8_t      buttonQueueCount = 0;
+static portMUX_TYPE buttonLock = portMUX_INITIALIZER_UNLOCKED;
+
+// The sampler's own state: read and written by buttonSample() alone.
+static bool     sampledDown     = false;   // the debounced level, true = pressed
+static uint32_t sampledRun      = 0;       // samples in a row that disagree with it
+static uint32_t sampledRunStart = 0;       // when that run of samples began
+static uint32_t sampledPressMs  = 0;       // when the current press began
+static bool     sampledLongSent = false;
+
+static esp_timer_handle_t buttonTimer = nullptr;
+
+static void queueButtonPress(ButtonEvent type, uint32_t startMs)
 {
-    return pressGeneration == viewGeneration &&
-           (int32_t)(pressStartMs - shownSinceMs) >= (int32_t)BUTTON_SCREEN_SETTLE_MS;
+    portENTER_CRITICAL(&buttonLock);
+    // A full queue means loop() has been stuck for seconds. The newest press is
+    // the one dropped, so the ones already waiting still run in order.
+    if (buttonQueueCount < BUTTON_QUEUE_SIZE) {
+        uint8_t slot = (uint8_t)((buttonQueueFirst + buttonQueueCount) % BUTTON_QUEUE_SIZE);
+        buttonQueue[slot].type    = type;
+        buttonQueue[slot].startMs = startMs;
+        buttonQueueCount++;
+    }
+    portEXIT_CRITICAL(&buttonLock);
 }
 
-static ButtonEvent readButton(uint32_t now)
+// The esp_timer callback. It runs in the esp_timer task, not in an interrupt,
+// so millis() and digitalRead() are safe here.
+static void buttonSample(void *)
 {
-    bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+    uint32_t now  = millis();
+    bool     down = (digitalRead(BUTTON_PIN) == LOW);
 
-    if (pressed != buttonFlicker) {
-        buttonFlicker  = pressed;
-        lastDebounceMs = now;
-    }
-    if (now - lastDebounceMs < BUTTON_DEBOUNCE_MS) return ButtonEvent::None;
-
-    buttonStable = buttonFlicker;
-
-    if (buttonStable && !buttonHeld) {
-        buttonHeld       = true;
-        buttonDownMs     = now;
-        longAlreadyFired = false;
-        // Where the finger actually pressed, i.e. the last raw change.
-        pressGeneration  = viewGeneration;
-        pressStartMs     = lastDebounceMs;
-    } else if (buttonStable && buttonHeld && !longAlreadyFired &&
-               (now - buttonDownMs >= BUTTON_LONG_PRESS_MS)) {
-        longAlreadyFired = true;   // even an ignored long press swallows the release
-        if (!pressCounts()) return ButtonEvent::None;
-        return ButtonEvent::Long;
-    } else if (!buttonStable && buttonHeld) {
-        buttonHeld = false;
-        if (!longAlreadyFired) {
-            if (!pressCounts()) return ButtonEvent::None;
-            return ButtonEvent::Short;
+    if (down == sampledDown) {
+        sampledRun = 0;                        // bounce or a spike: the level came back
+    } else {
+        if (sampledRun == 0) sampledRunStart = now;
+        sampledRun++;
+        if (sampledRun >= BUTTON_DEBOUNCE_SAMPLES) {
+            sampledDown = down;
+            sampledRun  = 0;
+            if (down) {
+                // Where the finger actually pressed, not where the debounce
+                // finished: the button rule compares this with the view.
+                sampledPressMs  = sampledRunStart;
+                sampledLongSent = false;
+            } else if (!sampledLongSent) {
+                queueButtonPress(ButtonEvent::Short, sampledPressMs);
+            }
         }
     }
 
-    return ButtonEvent::None;
+    if (sampledDown && !sampledLongSent && (now - sampledPressMs >= BUTTON_LONG_PRESS_MS)) {
+        sampledLongSent = true;                // the release after it is swallowed
+        queueButtonPress(ButtonEvent::Long, sampledPressMs);
+    }
+}
+
+static void startButtonSampling()
+{
+    esp_timer_create_args_t args = {};
+    args.callback        = &buttonSample;
+    args.arg             = nullptr;
+    args.dispatch_method = ESP_TIMER_TASK;
+    args.name            = "button";
+
+    if (esp_timer_create(&args, &buttonTimer) != ESP_OK ||
+        esp_timer_start_periodic(buttonTimer, (uint64_t)BUTTON_SAMPLE_MS * 1000ULL) != ESP_OK) {
+        Serial.println("Button timer failed to start - the button will not respond");
+    }
+}
+
+// The next press waiting, if any, after the button rule: a press counts only
+// if the view it would act on was already showing BUTTON_SCREEN_SETTLE_MS
+// before the press began. shownSinceMs is when that view appeared, so a view
+// that changed at any point during the press - or between the release and
+// loop() getting to it - is later than the press start and fails the test as
+// well. That covers "the view changed while the button was held" and "the press
+// started just before a new view appeared": either way the press would act on a
+// screen the operator was not looking at. An ignored press makes no beep.
+static ButtonEvent takeButtonEvent()
+{
+    ButtonPress press = {ButtonEvent::None, 0};
+
+    portENTER_CRITICAL(&buttonLock);
+    if (buttonQueueCount > 0) {
+        press = buttonQueue[buttonQueueFirst];
+        buttonQueueFirst = (uint8_t)((buttonQueueFirst + 1) % BUTTON_QUEUE_SIZE);
+        buttonQueueCount--;
+    }
+    portEXIT_CRITICAL(&buttonLock);
+
+    if (press.type == ButtonEvent::None) return ButtonEvent::None;
+    if ((int32_t)(press.startMs - shownSinceMs) < (int32_t)BUTTON_SCREEN_SETTLE_MS) return ButtonEvent::None;
+    return press.type;
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,12 +1701,22 @@ void setup()
 {
     Serial.begin(SERIAL_BAUD);
 
+    // The internal pull-up stays on alongside the 470 R one: should that
+    // resistor ever come off, the button still works, just with the old
+    // contact current.
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(GREEN_LED_PIN, OUTPUT);
     pinMode(BLUE_LED_PIN, OUTPUT);
     pinMode(YELLOW_LED_PIN, OUTPUT);
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
+
+    // Before anything below can return early: without it the button is dead.
+    // The rule's clock starts here, so a button already held at power-up - its
+    // press begins at the first sample - falls inside BUTTON_SCREEN_SETTLE_MS
+    // and is ignored, however long the boot took.
+    shownSinceMs = millis();
+    startButtonSampling();
 
     prefs.begin("tractor", false);
     // Stored in the ESP32's NVS partition in flash - no battery involved, so
@@ -1659,11 +1735,12 @@ void setup()
     oled.begin(SH1106_SWITCHCAPVCC, OLED_I2C_ADDRESS);
     // oled.begin() calls Wire.begin(), which leaves the bus at the Arduino
     // default of 100 kHz. A full framebuffer push is ~1150 bytes, so at
-    // 100 kHz every redraw blocks loop() for ~100 ms - long enough that the
-    // button, which is only sampled once per loop, starts dropping presses.
-    // 400 kHz brings that to ~26 ms. The original AVR library set the same
-    // speed via TWBR; that register write had to be removed for the ESP32
-    // port, so it is done here instead.
+    // 100 kHz every redraw blocks loop() for ~100 ms; 400 kHz brings that to
+    // ~30 ms. The button no longer depends on it - a timer samples it - but
+    // everything a press does, the screen, the LEDs and the buzzer's beat all
+    // wait for loop(). The original AVR library set the same speed via TWBR;
+    // that register write had to be removed for the ESP32 port, so it is done
+    // here instead.
     Wire.setClock(400000);
     oled.display();
     oled.clearDisplay();
@@ -1724,13 +1801,14 @@ void loop()
         shownView    = v;
         shownFault   = faultCode;   // two different full-screen faults are two different screens
         shownSinceMs = now;
-        viewGeneration++;
         displayDirty = true;
         if (v == View::ClogChoice) clogChoiceIndex = 0;   // Anuluj preselected every time it appears
     }
 
-    // 5. Button, dispatched on the current view.
-    ButtonEvent event = readButton(now);
+    // 5. Button, dispatched on the current view. At most one press per
+    //    iteration: if it changes the view, step 4 sees that before the next
+    //    queued press is judged.
+    ButtonEvent event = takeButtonEvent();
     if (event != ButtonEvent::None) {
         handleView(v, event);
         // Confirm a counted long press audibly so the operator needn't watch

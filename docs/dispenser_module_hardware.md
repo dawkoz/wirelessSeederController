@@ -261,12 +261,15 @@ not do this.
 
 `GPIO12` is the **MTDI strapping pin**: its level at reset selects the flash
 voltage (VDD_SDIO). Held high at reset, the chip configures 1.8 V flash and
-**fails to boot**. Both existing modules use GPIO12 — the seeder for the relay,
-the tractor for the button. Both work today because the pin sits low at reset.
+**fails to boot**. The seeder uses GPIO12 for the relay, and works because
+the pin sits low at reset. **Never add an external pull-up to GPIO12**, and if
+you ever swap the relay module for one with a pull-up on its input, expect a
+board that no longer boots.
 
-Nothing needs changing. But **never add an external pull-up to GPIO12** on
-either board, and if you ever swap the relay module for one with a pull-up on
-its input, expect a board that no longer boots.
+The tractor used GPIO12 for its button until 27 September 2026. The button
+needed a strong pull-up — a car-style switch misses presses at the internal
+pull-up's tiny current — so it moved to GPIO32, where it could have one
+(CLAUDE.md, Hardware and pins → Tractor).
 
 ---
 

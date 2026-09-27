@@ -98,8 +98,13 @@ static constexpr uint32_t TURBINE_MIN_PULSE_GAP_US   = 1000;   // shorter gaps a
 
 // --- Pins -------------------------------------------------------------------
 
-static constexpr uint8_t BUTTON_PIN       = 12;     // to GND. Strapping pin: never add a pull-up to this line
-static constexpr uint8_t GREEN_LED_PIN    = 14;     // all links healthy
+// The button closes to GND and has a 470 R pull-up to 3V3 (plus 10-100 nF to GND)
+// at the board. It used to be on GPIO12, where only the internal ~45k pull-up
+// was allowed - a strapping pin must never be pulled high - and ~0.07 mA is too
+// little for a car-style switch: its contacts film over and miss the first
+// press after a pause. 470 R puts ~7 mA through them. GPIO32 has no boot role.
+static constexpr uint8_t BUTTON_PIN       = 32;
+static constexpr uint8_t GREEN_LED_PIN    = 14;     // all links healthy; flickers during boot (GPIO14 does), harmless
 static constexpr uint8_t BLUE_LED_PIN     = 27;     // blinks while a link is down
 static constexpr uint8_t YELLOW_LED_PIN   = 13;     // tramline relay on
 static constexpr uint8_t BUZZER_PIN       = 19;
@@ -107,8 +112,15 @@ static constexpr uint8_t OLED_I2C_ADDRESS = 0x3C;
 
 // --- Button -----------------------------------------------------------------
 
-static constexpr uint32_t BUTTON_DEBOUNCE_MS   = 50;
+// A timer samples the button every BUTTON_SAMPLE_MS, whatever loop() is doing,
+// and a level counts once it has held for BUTTON_DEBOUNCE_MS of samples in a
+// row. Contacts bounce for well under 10 ms; anything shorter than this - bounce,
+// a spike on the cable - is not a press.
+static constexpr uint32_t BUTTON_SAMPLE_MS     = 5;
+static constexpr uint32_t BUTTON_DEBOUNCE_MS   = 20;
 static constexpr uint32_t BUTTON_LONG_PRESS_MS = 1500;
+static_assert(BUTTON_DEBOUNCE_MS % BUTTON_SAMPLE_MS == 0 && BUTTON_DEBOUNCE_MS / BUTTON_SAMPLE_MS >= 2,
+              "BUTTON_DEBOUNCE_MS must be a whole number of samples, at least two");
 // A press counts only if its screen was already showing this long before the
 // press began - faster than a person can react to a new screen.
 static constexpr uint32_t BUTTON_SCREEN_SETTLE_MS = 250;
