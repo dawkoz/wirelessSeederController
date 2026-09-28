@@ -287,3 +287,83 @@ static_assert(UNCLOG_PAUSE_MS >= 2 * MOTOR_CONTROL_INTERVAL_MS,
 // --- Calibration run --------------------------------------------------------
 
 static constexpr uint16_t CALIBRATION_RPM = 120; // moderate, so the auger fills as it does in work
+
+// --- Burst metering (a motor that cannot turn the auger slowly) -------------
+
+// The fitted motor cannot turn the loaded auger at a low duty: it stalls and
+// the clog alarm fires. So instead of a slow continuous rate, every wheel pulse
+// is dosed as one burst at BURST_PWM_FRACTION of full PWM until the encoder has
+// counted that pulse's share of the ground, then stop. The dose per metre is
+// exactly what the continuous rate gives; only the timing differs (burstMeter()
+// in src/dispenser/dispenser_logic.h). The calibration run follows the switch:
+// its 100 revolutions at the burst PWM, the way the auger turns in work - so
+// recalibrate after changing it.
+// false = the continuous rate control above, for a motor that can hold a speed.
+static constexpr bool DISPENSER_BURST_MODE = true;
+
+// How hard a burst drives the motor, as a share of full PWM: 1.0 is flat out,
+// 0.75, 0.5 and so on less. Only the power: a burst still comes with every
+// pulse and still ends on that pulse's count from the encoder, so a gentler one
+// simply turns slower and lasts longer, and the dose is the same. There is no
+// speed control - how fast the shaft turns changes nothing the encoder counts.
+// Three things do follow from it:
+//  - grams per revolution can depend on how fast the auger turns, which is why
+//    the calibration run uses this same PWM; calibrate with the engine running,
+//    as in work, since the battery voltage moves the speed too;
+//  - the torque falls with it, so a shaft that slows under the clog line in the
+//    middle of a burst gets full PWM until it moves again (burstDuty() in
+//    src/dispenser/dispenser_logic.h), and only a shaft that full PWM cannot
+//    move either is a clog;
+//  - the top working speed falls in step, because a burst has to finish before
+//    the next pulse: v_max [m/s] = burst RPM x C / (2400 x D) at 4 m, C in g
+//    per 100 revolutions, D in kg/ha. A free motor turns about 330 RPM at 1.0,
+//    165 at 0.5, less under load; at 40 kg/ha and 500 g that is 6.2 km/h at 1.0
+//    and 3.1 km/h at 0.5. Faster than that, ZA SZYBKO sounds.
+static constexpr float BURST_PWM_FRACTION = 1.0f;
+static constexpr uint16_t BURST_PERMILLE = (uint16_t)(BURST_PWM_FRACTION * 1000.0f + 0.5f);
+
+// What is owed below this waits for the next pulse, so the sliver of rounding
+// left over from a burst never twitches the motor.
+static constexpr uint32_t BURST_MIN_EDGES = ENCODER_EDGES_PER_REV / 10; // a tenth of a turn
+
+// How far the motor may fall behind the ground, in pulses. Reached only when it
+// cannot keep up at all (ZA SZYBKO): whatever would go past it is dropped, so
+// slowing down afterwards never dumps more than this in one place. Not below 3:
+// a radio gap just short of LINK_TIMEOUT_MS can deliver two or three pulses in
+// one packet at speed, and every one of them is owed.
+static constexpr uint8_t BURST_MAX_BACKLOG_PULSES = 3;
+
+// ZA SZYBKO. A pulse is late when it arrives with the motor still more than this
+// many pulses' turns behind on the earlier ones; BURST_LATE_PULSES late pulses in
+// a row mean it cannot keep up with the machine, and the alarm clears when a
+// pulse finds it caught up again. A single late pulse is usually the radio: a
+// packet lost or delayed starts one burst late. Simulated on a bad radio
+// (packets 100-300 ms apart, one in ten lost): no alarm at 80 % of the motor's
+// speed and one short one in 10 minutes at 90 %; driving 15 % too fast raises it
+// after about 4 s, 40 % too fast after 2 s. At half a pulse, the first value
+// tried, it sounded twice in 10 minutes already at 80 %.
+static constexpr float BURST_LATE_FRACTION = 1.0f;
+static constexpr uint8_t BURST_LATE_PULSES = 2;
+
+// Clogged: the shaft stays under this - or under a third (CLOG_MIN_SPEED_PERCENT)
+// of what the burst PWM turns a free motor at, if that is lower - for
+// CLOG_DETECT_MS while a burst drives it: 60 RPM at full PWM, 54 at half. A
+// blocked auger reads close to 0; a heavy one that still turns, well above it -
+// a false alarm here stops the dispenser in the field.
+static constexpr uint16_t BURST_CLOG_MIN_RPM = 60;
+
+// The shaft RPM the tractor shows is averaged over about this long: the shaft
+// itself alternates between the burst's speed and standing still.
+static constexpr uint32_t BURST_RPM_AVERAGE_MS = 2000;
+
+static_assert(BURST_PWM_FRACTION > 0.0f && BURST_PWM_FRACTION <= 1.0f,
+              "BURST_PWM_FRACTION is a share of full PWM: above 0, at most 1.0");
+static_assert(BURST_PERMILLE >= MOTOR_MIN_RUNNING_PERMILLE && BURST_PERMILLE <= 1000,
+              "BURST_PWM_FRACTION is too low to turn the motor at all");
+static_assert(BURST_MIN_EDGES > 0, "BURST_MIN_EDGES must be at least one edge");
+// Once the backlog sits at its cap, a new pulse must still find more than
+// BURST_LATE_FRACTION to do, or ZA SZYBKO could never be raised.
+static_assert((float)BURST_MAX_BACKLOG_PULSES >= 1.0f + BURST_LATE_FRACTION,
+              "BURST_MAX_BACKLOG_PULSES must leave room for a late pulse");
+static_assert(BURST_CLOG_MIN_RPM > 0 && BURST_CLOG_MIN_RPM < MOTOR_MAX_RPM,
+              "BURST_CLOG_MIN_RPM must be between 0 and the motor's speed");

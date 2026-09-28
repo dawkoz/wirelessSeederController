@@ -156,6 +156,10 @@ uint8_t dispenserLinkFlags()
 
 bool dispenserControlTick(DispenserLogic &logic, uint32_t nowMs, DispenserOutputs &out)
 {
+    // On every call, not only every control step: a burst ends on its encoder
+    // count, and at full speed one step is over half a turn of the shaft.
+    if (dispenserBurstStop(logic, encoderEdges(), out)) motorApply(out);
+
     DispenserInputs in;
     dispenserReadInputs(nowMs, in);
     if (!dispenserStep(logic, in, out)) return false;

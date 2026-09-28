@@ -66,7 +66,7 @@ static void m01Run(const M01Case &c)
 static void runMeteringTests()
 {
     Serial.println();
-    Serial.println("--- M: metering and links (motor, free shaft) ---");
+    Serial.println("--- M: metering and links (continuous metering, motor, free shaft) ---");
 
     const M01Case cases[] = {
         {"M01a", "(a) no packets",            false, false, 1, 40, 500, 1000, 1},
@@ -492,7 +492,7 @@ static bool cRunToDone()
 static void runCalibrationTests()
 {
     Serial.println();
-    Serial.println("--- C: calibration run (motor, free shaft) ---");
+    Serial.println("--- C: calibration run (continuous metering, motor, free shaft) ---");
 
     // C01 - a full run.
     {
@@ -779,7 +779,7 @@ static bool kCauseClog(uint32_t *msToClog)
 static void runClogTests()
 {
     Serial.println();
-    Serial.println("--- K: clog and unclogging (motor) ---");
+    Serial.println("--- K: clog and unclogging (continuous metering, motor) ---");
 
     // K01 - the clog itself.
     if (abortRequested) return;

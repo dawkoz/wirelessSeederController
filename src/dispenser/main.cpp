@@ -10,6 +10,8 @@
 // Fertilizer dispenser module. Meters fertilizer in proportion to the ground
 // speed broadcast by the seeder, using the dose and calibration broadcast by
 // the tractor. Cytron MD13S driver, Pololu 4752 motor with built-in encoder.
+// With DISPENSER_BURST_MODE on it doses each wheel pulse in one full-duty
+// burst instead, for a motor that cannot turn the auger slowly.
 //
 // This file is deliberately thin: the decision logic lives in
 // dispenser_logic.h (hardware-free, tested by the bench image) and the I/O in
@@ -117,7 +119,8 @@ void setup()
     }
 
     dispenserInit(logic, millis(), encoderEdges());
-    Serial.println("Dispenser module ready");
+    Serial.println(DISPENSER_BURST_MODE ? "Dispenser module ready - burst metering, one full-duty burst per wheel pulse"
+                                        : "Dispenser module ready - continuous metering");
 }
 
 void loop()

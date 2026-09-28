@@ -525,16 +525,26 @@ to fit it, and asks you to remove it before it does anything else.
 
 | Keys | What you need | What it proves |
 |---|---|---|
-| `d` | nothing connected | the decision logic and the distance ledger, 35 + 12 checks, milliseconds |
+| `d` | nothing connected | the decision logic and the distance ledger, 35 + 12 checks, and burst metering, 28 more (B01–B28, bursts at full and at half PWM) — a second or two |
 | `w` | nothing connected | ground speed from wheel pulses (the seeder's own logic), 11 checks |
 | `v` | nothing connected | packet validation, the inbox and the link timing |
 | `h` | coupling off, shaft free to turn | supply, driver, motor, both encoder channels, DIR, radio |
 | `m` | coupling off, shaft free | metering and every link-loss case, with the motor running; M11 checks the turns delivered over simulated ground |
 | `c` | coupling off, shaft free | the 100-revolution calibration run |
 | `k` | coupling off; K07 needs the lever | clog detection and the unclog sequence |
+| `b` | coupling off, shaft free | burst metering with the motor (U01–U04), at the production burst PWM (`BURST_PWM_FRACTION`): one burst per simulated wheel pulse, the turns against the ground, over speed, the calibration run, a clog in the middle of a burst |
 
 `a` runs all of them in that order, `r` prints the summary so far, `x` stops the
 motor, `?` reprints the menu and the boot report.
+
+**Which metering each key tests.** `m`, `c`, `k` and `p` were written for
+continuous metering and always test it, whatever `DISPENSER_BURST_MODE` says;
+`b` and the B checks in `d` always test burst metering (CLAUDE.md, Dispenser
+behaviour → Burst metering). With burst metering on, `b` is the one that tests
+what the module will do on the machine. Its U01 prints the shaft's RPM during
+the bursts — run it once more on the fitted module with the auger coupled and
+fertilizer in the hopper, and that number is what the loaded motor really
+turns at the chosen burst PWM, which is what limits the working speed.
 
 `p` runs **one simulated pass** on its own — it is not part of `a`, and it is
 for watching rather than proving. The tractor and seeder packets describe a

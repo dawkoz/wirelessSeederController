@@ -63,7 +63,7 @@ static const char *ridePhaseAt(uint32_t t)
 static void runRideTest()
 {
     Serial.println();
-    Serial.println("--- P: one simulated pass (motor, free shaft) ---");
+    Serial.println("--- P: one simulated pass (continuous metering, motor, free shaft) ---");
     Serial.printf(" %.1f km/h, %u kg/ha, %lu g per 100 rev: %.0f RPM while seeding\n",
                   (double)RIDE_SPEED_MM_S * 0.0036, (unsigned)RIDE_DOSE_KG_HA, (unsigned long)RIDE_GRAMS,
                   independentRPM(RIDE_SPEED_MM_S, RIDE_DOSE_KG_HA, RIDE_GRAMS));

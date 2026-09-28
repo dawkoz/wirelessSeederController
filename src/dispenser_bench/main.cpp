@@ -311,7 +311,11 @@ static bool pumpUntil(uint32_t startMs, uint32_t offsetMs)
 // Every hardware-in-the-loop test starts here: motor off, a known inbox, a
 // silent injector, a fresh logic, and a still shaft. False means the operator
 // asked to abort, and the test must not run at all.
-static bool benchPrepare()
+//
+// burst picks the metering, whatever DISPENSER_BURST_MODE says: the M, C, K and
+// P tests were written for continuous metering and keep testing it; the U tests
+// ask for burst metering.
+static bool benchPrepare(bool burst = false)
 {
     if (abortRequested) return false;
 
@@ -335,6 +339,7 @@ static bool benchPrepare()
     // spanned the whole second, and its integral kick held M02 about 10 % over
     // the target for the next few seconds.
     dispenserInit(logic, millis(), encoderEdges());
+    logic.burstMode = burst;
     lastPrintedMode = logic.mode;
     return true;
 }
@@ -458,8 +463,15 @@ static void bootReport()
                   (unsigned long)UNCLOG_TOTAL_MS, (unsigned)UNCLOG_PERMILLE,
                   (unsigned long)UNCLOG_REVERSE_MS, (unsigned long)UNCLOG_PAUSE_MS,
                   (unsigned long)UNCLOG_FORWARD_MS, (unsigned)UNCLOG_CYCLES);
-    Serial.printf("   calibration     %u revolutions at %u RPM\n",
+    Serial.printf("   calibration     %u revolutions at %u RPM, or at full duty in burst metering\n",
                   (unsigned)CALIBRATION_REVOLUTIONS, (unsigned)CALIBRATION_RPM);
+    Serial.printf("   production      %s metering (DISPENSER_BURST_MODE)\n",
+                  DISPENSER_BURST_MODE ? "BURST" : "continuous");
+    Serial.printf("   burst           one per wheel pulse at %u permille (BURST_PWM_FRACTION %.2f), full PWM "
+                  "if it stalls, clog under %u RPM or a third of what the PWM turns a free motor at, ZA SZYBKO "
+                  "after %u late pulses, backlog cap %u pulses\n",
+                  (unsigned)BURST_PERMILLE, (double)BURST_PWM_FRACTION, (unsigned)BURST_CLOG_MIN_RPM,
+                  (unsigned)BURST_LATE_PULSES, (unsigned)BURST_MAX_BACKLOG_PULSES);
 
     Serial.printf(" ESP-NOW: %s\n", bootInfo.espnowOk ? "initialised" : "FAILED TO INITIALISE");
 }
@@ -468,15 +480,16 @@ static void printMenu()
 {
     Serial.println();
     Serial.println("--- menu ------------------------------------------------------------------");
-    Serial.println("  d  logic tests (D01-D35 and the ledger, L01-L12, no hardware)");
+    Serial.println("  d  logic tests (D01-D35, the ledger L01-L12, burst metering B01-B28, no hardware)");
     Serial.println("  w  ground speed from wheel pulses (W01-W11, no hardware)");
     Serial.println("  v  packet tests (V01-V08, no motor)");
     Serial.println("  h  hardware (H00-H07, motor: read the checklist first)");
-    Serial.println("  m  metering and links (M01-M10, motor)");
-    Serial.println("  c  calibration run (C01-C06, motor)");
-    Serial.println("  k  clog and unclogging (K01-K07, motor)");
+    Serial.println("  m  metering and links, continuous metering (M01-M11, motor)");
+    Serial.println("  c  calibration run, continuous metering (C01-C06, motor)");
+    Serial.println("  k  clog and unclogging, continuous metering (K01-K07, motor)");
+    Serial.println("  b  burst metering: bursts, over speed, calibration, clog (U01-U04, motor)");
     Serial.println("  a  all of the above, in that order");
-    Serial.println("  p  one simulated pass: pull away, seed 6 s, stop (P01, motor, not in a)");
+    Serial.println("  p  one simulated pass, continuous metering: pull away, seed 6 s, stop (P01, motor, not in a)");
     Serial.println("  r  report so far");
     Serial.println("  x  motor off now");
     Serial.println("  ?  this menu and the boot report");
@@ -512,10 +525,12 @@ static bool askMotorChecklist()
 // ---------------------------------------------------------------------------
 
 #include "tests_logic.h"
+#include "tests_burst.h"
 #include "tests_wheel.h"
 #include "tests_packets.h"
 #include "tests_hardware.h"
 #include "tests_scenarios.h"
+#include "tests_burst_motor.h"
 #include "tests_ride.h"
 
 // ---------------------------------------------------------------------------
@@ -574,7 +589,7 @@ void loop()
     if (c == '\r' || c == '\n' || c < 0) return;
 
     // Only the commands that turn the motor need the setup checklist.
-    bool motorCommand = (c == 'h' || c == 'm' || c == 'c' || c == 'k' || c == 'a' || c == 'p');
+    bool motorCommand = (c == 'h' || c == 'm' || c == 'c' || c == 'k' || c == 'b' || c == 'a' || c == 'p');
     if (motorCommand && !askMotorChecklist()) {
         Serial.println(">> motor tests skipped");
         return;
@@ -583,6 +598,7 @@ void loop()
     switch (c) {
         case 'd':
             runLogicTests();
+            runBurstTests();
             break;
         case 'w':
             runWheelTests();
@@ -602,15 +618,20 @@ void loop()
         case 'k':
             runClogTests();
             break;
+        case 'b':
+            runBurstMotorTests();
+            break;
         case 'a':
             abortRequested = false;
             runLogicTests();
+            runBurstTests();
             if (!abortRequested) runWheelTests();
             if (!abortRequested) runPacketTests();
             if (!abortRequested) runHardwareTests();
             if (!abortRequested) runMeteringTests();
             if (!abortRequested) runCalibrationTests();
             if (!abortRequested) runClogTests();
+            if (!abortRequested) runBurstMotorTests();
             break;
         case 'p':
             runRideTest();

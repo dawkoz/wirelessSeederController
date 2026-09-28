@@ -63,6 +63,9 @@ static double independentRPM(uint16_t speedMmS, uint16_t doseKgPerHa, uint32_t g
 static void dFresh(DHarness &h)
 {
     dispenserInit(h.logic, 100000, 0);
+    // The D and L tests are about continuous metering, whatever
+    // DISPENSER_BURST_MODE says; burst metering has the B tests (tests_burst.h).
+    h.logic.burstMode = false;
 
     h.out = {0, true};
     h.nowMs     = 100000;

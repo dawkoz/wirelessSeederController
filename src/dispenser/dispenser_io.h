@@ -20,4 +20,7 @@ void     dispenserHandlePacket(const uint8_t *data, int len);   // the whole bod
 void     dispenserReadInputs(uint32_t nowMs, DispenserInputs &in);
 void     dispenserResetInbox();                 // forget every received packet (bench only)
 uint8_t  dispenserLinkFlags();
+// Call as often as possible: it ends a running burst on its encoder count on
+// every call, and runs a control step every MOTOR_CONTROL_INTERVAL_MS (true
+// when it did).
 bool     dispenserControlTick(DispenserLogic &logic, uint32_t nowMs, DispenserOutputs &out);
