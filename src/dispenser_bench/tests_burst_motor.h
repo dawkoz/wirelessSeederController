@@ -12,7 +12,9 @@
 // on after a burst is cut, the calibration run, and a clog in the middle of a
 // burst. Real time and simulated packets, like the M tests, with burst metering
 // switched on whatever DISPENSER_BURST_MODE says, at the production burst PWM
-// (BURST_PWM_FRACTION): the ground speeds and time limits below follow it.
+// (BURST_PWM_FRACTION). The angle factor's angle follows the PWM, so the
+// ground speeds below keep the motor as busy at any PWM, and the time limits
+// follow it.
 //
 // Coupling off and a free shaft, like the M tests. Run on the fitted module
 // with the auger coupled and fertilizer in the hopper (bench image flashed, a
@@ -70,12 +72,15 @@ static double uBurstRPM(const UWatch &w)
     return (double)w.onEdges * 60000.0 / ((double)w.onMs * (double)ENCODER_EDGES_PER_REV);
 }
 
-// Turns per pulse at the injector's settings, independent of the logic.
+// Turns per pulse at the injector's settings, independent of the logic: the
+// angle factor, in thousandths of what BURST_ANGLE_REFERENCE_RPM at the burst
+// PWM turns between two pulses at BURST_ANGLE_REFERENCE_SPEED_MM_S.
 static double uRevsPerPulse()
 {
-    return (double)WORKING_WIDTH_CM * (double)injector.tractor.doseKgPerHa /
-           (10.0 * (double)injector.tractor.gramsPer100Rev) *
-           (double)injector.tractor.wheelMmPerPulse / 1000.0;
+    double pulseSeconds = (double)injector.tractor.wheelMmPerPulse / (double)BURST_ANGLE_REFERENCE_SPEED_MM_S;
+    double refRevs      = (double)BURST_ANGLE_REFERENCE_RPM * ((double)BURST_PERMILLE / 1000.0) / 60.0 *
+                          pulseSeconds;
+    return (double)injector.tractor.burstAngleFactor / 1000.0 * refRevs;
 }
 
 // What the burst PWM turns a free motor at, near enough: MOTOR_MAX_RPM at full
@@ -86,11 +91,12 @@ static double uBurstNominalRPM()
 }
 
 // The ground speed that keeps the motor busy for about `share` of the time at
-// the burst PWM, with the injector's default dose and calibration: at 1000 mm/s
-// they ask for independentRPM(1000, 40, 500) = 192 RPM.
+// the burst PWM, with the injector's settings: the pulses a second times the
+// turns each, against the turns a second the motor makes.
 static uint16_t uGroundFor(double share)
 {
-    return (uint16_t)(share * uBurstNominalRPM() / independentRPM(1000, 40, 500) * 1000.0);
+    return (uint16_t)(share * uBurstNominalRPM() / 60.0 / uRevsPerPulse() *
+                      (double)injector.tractor.wheelMmPerPulse);
 }
 
 static void runBurstMotorTests()
@@ -156,8 +162,9 @@ static void runBurstMotorTests()
         }
     }
 
-    // U02 - faster than the motor, then slower again: 3000 mm/s asks for 576 RPM,
-    // more than any burst speed; the slow speed keeps it busy half the time.
+    // U02 - faster than the motor, then slower again: the fast speed asks for
+    // twice the turns the burst PWM makes, the slow one keeps it busy half the
+    // time.
     if (abortRequested) return;
     {
         TestMarker tm("U02");
@@ -165,7 +172,8 @@ static void runBurstMotorTests()
 
         if (!benchPrepare(true)) { reportLine("U02", Outcome::Aborted, "aborted by key"); return; }
         injectorDefaults(injector);
-        injector.seeder.groundSpeedMmS = 3000;
+        uint16_t fast = uGroundFor(2.0);
+        injector.seeder.groundSpeedMmS = fast;
         injectorStart(injector, millis());
 
         uint32_t t0 = millis();
@@ -193,13 +201,17 @@ static void runBurstMotorTests()
         uint32_t tCleared = millis() - t1;
 
         bool ok = raised && steady && cleared && !gSawClogged;
-        reportCheck("U02", ok, "3000 mm/s: OverSpeed after %lu ms (limit 6000), held for 3 s %s; %u mm/s: "
+        reportCheck("U02", ok, "%u mm/s: OverSpeed after %lu ms (limit 6000), held for 3 s %s; %u mm/s: "
                     "cleared after %lu ms (limit 15000); never Clogged %s",
-                    (unsigned long)tRaised, steady ? "yes" : "NO", (unsigned)slow, (unsigned long)tCleared,
-                    gSawClogged ? "NO" : "yes");
+                    (unsigned)fast, (unsigned long)tRaised, steady ? "yes" : "NO", (unsigned)slow,
+                    (unsigned long)tCleared, gSawClogged ? "NO" : "yes");
     }
 
-    // U03 - the calibration run at the burst PWM, stopped on the exact count.
+    // U03 - the calibration run: CALIBRATION_PULSES real bursts spaced as at
+    // CALIBRATION_SPEED_MM_S, each one pulse's angle, stopped on the exact
+    // count. 2.5 m per pulse puts the pulses 1.5 s apart and an angle factor of
+    // 889 asks for 4 turns each at full PWM (2 at half), so a free shaft makes
+    // that many separate bursts with pauses between them.
     if (abortRequested) return;
     {
         TestMarker tm("U03");
@@ -207,8 +219,10 @@ static void runBurstMotorTests()
 
         if (!benchPrepare(true)) { reportLine("U03", Outcome::Aborted, "aborted by key"); return; }
         injectorDefaults(injector);
-        injector.tractor.calibrationRun = 0;
-        injector.tractor.sending        = true;
+        injector.tractor.wheelMmPerPulse  = 2500;
+        injector.tractor.burstAngleFactor = 889;
+        injector.tractor.calibrationRun   = 0;
+        injector.tractor.sending         = true;
         injectorSchedule(injector, millis());
         if (!runFor(1000)) { reportLine("U03", Outcome::Aborted, "aborted by key"); return; }
 
@@ -217,28 +231,46 @@ static void runBurstMotorTests()
         bool started = pollUntil(300, []() { return logic.mode == DispenserMode::Calibrating; });
         if (abortRequested) { reportLine("U03", Outcome::Aborted, "aborted by key"); return; }
 
-        // 100 turns at the burst PWM - 18 s at 330 RPM, 36 s at half PWM - and
-        // the limit allows for a motor at half that.
-        uint32_t limit = (uint32_t)(2.0 * (double)CALIBRATION_REVOLUTIONS * 60000.0 / uBurstNominalRPM()) + 5000;
-        uint32_t start = millis();
-        bool done = pollUntil(limit, []() { return logic.mode != DispenserMode::Calibrating; });
-        if (abortRequested) { reportLine("U03", Outcome::Aborted, "aborted by key"); return; }
+        // The run takes CALIBRATION_PULSES pulse intervals, or as long as all
+        // its turns take if the motor cannot keep up; the limit allows for a
+        // motor at half the burst PWM's nominal speed.
+        double   wantTurns = (double)CALIBRATION_PULSES * uRevsPerPulse();
+        uint32_t wantEdges = (uint32_t)(wantTurns * (double)ENCODER_EDGES_PER_REV + 0.5);
+        uint32_t interval  = (uint32_t)injector.tractor.wheelMmPerPulse * 1000 / CALIBRATION_SPEED_MM_S;
+        uint32_t limit     = (uint32_t)CALIBRATION_PULSES * interval +
+                             (uint32_t)(2.0 * wantTurns * 60000.0 / uBurstNominalRPM()) + 5000;
+        uint32_t start    = millis();
+        uint32_t bursts   = 0;
+        bool     wasOn    = false;
+        bool     done     = false;
+        while (millis() - start < limit) {
+            if (!benchPump()) { reportLine("U03", Outcome::Aborted, "aborted by key"); return; }
+            bool on = out.motorPermille > 0;
+            if (on && !wasOn) bursts++;
+            wasOn = on;
+            if (logic.mode != DispenserMode::Calibrating) {
+                done = true;
+                break;
+            }
+            delay(1);
+        }
         uint32_t took = millis() - start;
         done = done && (logic.mode == DispenserMode::CalibrationDone);
 
         if (!runFor(1000)) { reportLine("U03", Outcome::Aborted, "aborted by key"); return; }
 
         uint32_t turned  = encoderEdges() - logic.calibrationStartEdges;
-        bool     edgesOk = turned >= CALIBRATION_TOTAL_EDGES && turned <= CALIBRATION_TOTAL_EDGES + ENCODER_EDGES_PER_REV / 2;
+        bool     edgesOk = turned + 1 >= wantEdges && turned <= wantEdges + ENCODER_EDGES_PER_REV / 2;
         bool     ok      = started && done && edgesOk && logic.progress == 100 && out.motorPermille == 0
-                        && !gSawBuzzingDuty;
+                        && !gSawBuzzingDuty && bursts >= 1 && bursts <= CALIBRATION_PULSES;
 
-        reportCheck("U03", ok, "calibration at the burst PWM: started %s, Done after %lu ms (limit %lu), "
-                    "%lu edges (want %lu..%lu), progress 100 %s",
-                    started ? "yes" : "NO", (unsigned long)took, (unsigned long)limit, (unsigned long)turned,
-                    (unsigned long)CALIBRATION_TOTAL_EDGES,
-                    (unsigned long)(CALIBRATION_TOTAL_EDGES + ENCODER_EDGES_PER_REV / 2),
-                    (logic.progress == 100) ? "yes" : "NO");
+        reportCheck("U03", ok, "calibration as %u pulses, one every %lu ms: started %s, %lu bursts (%u on a free "
+                    "shaft that keeps up), Done after %lu ms (limit %lu), %lu edges (want %lu, up to +%lu), "
+                    "progress 100 %s",
+                    (unsigned)CALIBRATION_PULSES, (unsigned long)interval, started ? "yes" : "NO",
+                    (unsigned long)bursts, (unsigned)CALIBRATION_PULSES, (unsigned long)took,
+                    (unsigned long)limit, (unsigned long)turned, (unsigned long)wantEdges,
+                    (unsigned long)(ENCODER_EDGES_PER_REV / 2), (logic.progress == 100) ? "yes" : "NO");
     }
 
     // U04 - a clog in the middle of a burst: channel A detached while the motor

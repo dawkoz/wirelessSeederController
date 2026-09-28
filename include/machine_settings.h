@@ -18,7 +18,11 @@
 // --- Machine ----------------------------------------------------------------
 
 static constexpr uint32_t WORKING_WIDTH_CM = 400;        // 4.00 m
-static constexpr uint16_t CALIBRATION_REVOLUTIONS = 100; // dispenser shaft turns per calibration run
+static constexpr uint16_t CALIBRATION_REVOLUTIONS = 100; // dispenser shaft turns per calibration run (continuous)
+// Wheel pulses the burst-mode calibration run doses: the dispenser fires that
+// many bursts, and the tractor weighs them against what that much ground should
+// get (see the burst metering section below).
+static constexpr uint8_t CALIBRATION_PULSES = 20;
 
 // --- Serial -----------------------------------------------------------------
 
@@ -70,7 +74,18 @@ static constexpr uint16_t WHEEL_MM_PER_PULSE_MAX = 5000;
 // pulse, but that close together the sensor could not tell one from the next
 // (27 September 2026), so the drive keeps its three.
 static constexpr uint8_t WHEEL_MAGNETS = 3;
-static constexpr uint8_t WHEEL_AVERAGE_INTERVALS = 3; // speed is averaged over this many gaps: one drive turn
+
+// The speed is averaged over this many gaps between pulses: five turns of the
+// drive, about 24 m, so the number on the work screen holds steady (the user's
+// choice, 28 September 2026 - one turn, 3 gaps, made it twitch). A stop still
+// shows at once: the late-pulse rule in src/seeder/wheel_speed.h and
+// WHEEL_MIN_SPEED_MM_S do not wait for the average. Burst metering doses by the
+// pulses and never reads the speed; continuous metering takes it as its
+// feed-forward, and the distance ledger makes up the lag after a start. The
+// price is a slower number: a change of speed takes 10-20 s to settle on the
+// screen (8 -> 4 km/h about 19 s). 9 or 6 react faster and twitch a little
+// more; 3 is the twitch this replaced.
+static constexpr uint8_t WHEEL_AVERAGE_INTERVALS = 15;
 
 // The slowest speed this sensor still calls "moving". A pulse that has not
 // arrived within (distance per pulse / this) means the machine has stopped: at
@@ -212,6 +227,7 @@ static constexpr bool DEFAULT_TRAMLINES_ENABLED = false;
 static constexpr bool DEFAULT_SEED_LARGE = false;
 static constexpr uint16_t DEFAULT_WHEEL_MM_SMALL = WHEEL_MM_PER_PULSE_DEFAULT;
 static constexpr uint16_t DEFAULT_WHEEL_MM_LARGE = WHEEL_MM_PER_PULSE_DEFAULT;
+static constexpr uint16_t DEFAULT_ANGLE_FACTOR = 500; // burst metering: the motor half busy at 10 km/h
 
 // ===========================================================================
 // DISPENSER  (wiring and parts: docs/dispenser_module_hardware.md)
@@ -293,11 +309,11 @@ static constexpr uint16_t CALIBRATION_RPM = 120; // moderate, so the auger fills
 // The fitted motor cannot turn the loaded auger at a low duty: it stalls and
 // the clog alarm fires. So instead of a slow continuous rate, every wheel pulse
 // is dosed as one burst at BURST_PWM_FRACTION of full PWM until the encoder has
-// counted that pulse's share of the ground, then stop. The dose per metre is
-// exactly what the continuous rate gives; only the timing differs (burstMeter()
-// in src/dispenser/dispenser_logic.h). The calibration run follows the switch:
-// its 100 revolutions at the burst PWM, the way the auger turns in work - so
-// recalibrate after changing it.
+// counted that pulse's angle, then stop (burstMeter() in
+// src/dispenser/dispenser_logic.h). The angle is set by the angle factor below,
+// calibrated on the tractor. The tractor and the dispenser both read this
+// switch - the tractor for which calibration screens to show - so flash both
+// after changing it.
 // false = the continuous rate control above, for a motor that can hold a speed.
 static constexpr bool DISPENSER_BURST_MODE = true;
 
@@ -315,12 +331,51 @@ static constexpr bool DISPENSER_BURST_MODE = true;
 //    src/dispenser/dispenser_logic.h), and only a shaft that full PWM cannot
 //    move either is a clog;
 //  - the top working speed falls in step, because a burst has to finish before
-//    the next pulse: v_max [m/s] = burst RPM x C / (2400 x D) at 4 m, C in g
-//    per 100 revolutions, D in kg/ha. A free motor turns about 330 RPM at 1.0,
-//    165 at 0.5, less under load; at 40 kg/ha and 500 g that is 6.2 km/h at 1.0
-//    and 3.1 km/h at 0.5. Faster than that, ZA SZYBKO sounds.
+//    the next pulse. The angle factor below is scaled on this same PWM, so
+//    whatever the fraction, F / 1000 is roughly how busy the motor is at the
+//    reference speed, 10 km/h: the top speed is about 10 km/h x 1000 / F, times
+//    the loaded motor's real full-PWM RPM over 300. Faster than that, ZA SZYBKO
+//    sounds. Change the fraction and the same F turns a proportionally smaller
+//    angle, so recalibrate.
 static constexpr float BURST_PWM_FRACTION = 1.0f;
 static constexpr uint16_t BURST_PERMILLE = (uint16_t)(BURST_PWM_FRACTION * 1000.0f + 0.5f);
+
+// The angle factor F (0-999, set on the tractor's Kalibracja screens, sent in
+// every command) is the angle each pulse's burst turns, in thousandths of a
+// reference: what the motor turns at full burst PWM - taken as
+// BURST_ANGLE_REFERENCE_RPM x BURST_PWM_FRACTION - in the time between two
+// pulses at BURST_ANGLE_REFERENCE_SPEED_MM_S. So 1000 would keep the motor busy
+// all the time at 10 km/h, and F = 500 at 1571 mm per pulse is 1.41 turns a
+// pulse. An estimate, not a measurement: the factor is calibrated by weighing,
+// so all the reference does is make F scale the bursts. The distance per pulse
+// is in both the reference and the ground, so F holds for either seed size.
+//
+// 999 is the most the tractor takes - about all the motor turns between two
+// pulses at 10 km/h - and that is the point: the machine is never driven
+// faster (8 km/h in practice) and the motor can do no more than full PWM, so
+// 999 is the machine's physical limit (the user's reference, 28 September
+// 2026). At full PWM a dose needs F = 6 x width [cm] x dose [kg/ha] x 2778 /
+// (300 x grams per 100 turns): at 4 m, past 999 when the auger gives less than
+// about 890 g per 100 turns at 40 kg/ha (445 g at 20). The calibration run then
+// still weighs short at 999, and the remedy is mechanical - more grams per turn,
+// a wider dispenser opening - not a different reference, which would only hide
+// the limit. The 300 RPM is assumed: a loaded motor that turns slower lowers
+// the real limit in proportion, and ZA SZYBKO sounds when it is reached.
+static constexpr uint16_t BURST_ANGLE_REFERENCE_RPM = 300;
+static constexpr uint16_t BURST_ANGLE_REFERENCE_SPEED_MM_S = 2778; // 10 km/h
+
+// The calibration run in burst mode fires real bursts: CALIBRATION_PULSES wheel
+// pulses as if driving at CALIBRATION_SPEED_MM_S - one every distance-per-pulse
+// at that speed, with the tractor's distance for the seed size in use (0.94 s
+// at 1571 mm) - each dosed exactly as in work: one burst, to the angle the
+// angle factor sets, at the burst PWM, carrying straight on if the next pulse
+// is due before one is done. Every pulse's angle is turned in full even then:
+// nothing is dropped the way it is in work when the motor falls hopelessly
+// behind, or the weight would come out short. The tractor shows what that
+// ground should get, CALIBRATION_PULSES x distance per pulse [m] x dose
+// [kg/ha] x 0.4 g at 4 m - 503 g at 1571 mm and 40 kg/ha - and after the run
+// takes the weighed mass and sets F = F x expected / weighed.
+static constexpr uint16_t CALIBRATION_SPEED_MM_S = 1667; // 6 km/h
 
 // What is owed below this waits for the next pulse, so the sliver of rounding
 // left over from a burst never twitches the motor.
@@ -367,3 +422,10 @@ static_assert((float)BURST_MAX_BACKLOG_PULSES >= 1.0f + BURST_LATE_FRACTION,
               "BURST_MAX_BACKLOG_PULSES must leave room for a late pulse");
 static_assert(BURST_CLOG_MIN_RPM > 0 && BURST_CLOG_MIN_RPM < MOTOR_MAX_RPM,
               "BURST_CLOG_MIN_RPM must be between 0 and the motor's speed");
+static_assert(CALIBRATION_PULSES >= 1, "CALIBRATION_PULSES must be at least one pulse");
+static_assert(BURST_ANGLE_REFERENCE_RPM > 0 && BURST_ANGLE_REFERENCE_SPEED_MM_S > 0,
+              "the angle factor's reference must be a speed of the motor and of the machine");
+static_assert(DEFAULT_ANGLE_FACTOR <= 999, "the angle factor has three digits on the tractor");
+// The pulses must come at least a millisecond apart even at the shortest distance.
+static_assert(CALIBRATION_SPEED_MM_S > 0 && (uint32_t)WHEEL_MM_PER_PULSE_MIN * 1000 >= CALIBRATION_SPEED_MM_S,
+              "CALIBRATION_SPEED_MM_S must be a speed, in mm/s");

@@ -16,10 +16,11 @@
 // The numbers behind the rules: the sensor is on the metering drive, so one
 // pulse is about 1.6 m with the 3 magnets fitted. That is a pulse every 0.7 s
 // at 8 km/h but only every 2.8 s at 2 km/h, which is why "stopped" is a speed
-// (WHEEL_MIN_SPEED_MM_S) and not a fixed timeout, and why the average spans a
-// whole turn of the drive. The tests run at BENCH_WHEEL_MM_PER_PULSE, the
-// distance they were checked with: every rule scales with the distance, and
-// the magnet count comes from WHEEL_MAGNETS.
+// (WHEEL_MIN_SPEED_MM_S) and not a fixed timeout, and why the average spans
+// whole turns of the drive - WHEEL_AVERAGE_INTERVALS gaps, five turns, so the
+// work screen's number holds steady. The tests run at BENCH_WHEEL_MM_PER_PULSE,
+// the distance they were checked with: every rule scales with the distance, and
+// the magnet count and the average come from machine_settings.h.
 // ---------------------------------------------------------------------------
 
 struct WHarness {
@@ -87,14 +88,20 @@ static void runWheelTests()
                     "steady 8 km/h: %u mm/s (want 2222 +-2 %%)", (unsigned)speed);
     }
 
-    // W02 - the speed halves and the average follows within a turn.
+    // W02 - the speed halves, and the average has followed it by the time the
+    // slower gaps fill it: on the way it is between the two, falling (unless
+    // the average is a single turn, when one turn is all it takes).
     {
         WHarness h; wFresh(h);
-        wRun(h, mm, 2222, 10);
-        wRun(h, mm, 1111, 8);
+        wRun(h, mm, 2222, WHEEL_AVERAGE_INTERVALS + 1);
+        wRun(h, mm, 1111, WHEEL_MAGNETS);
+        uint16_t oneTurn = wSpeed(h, mm);
+        wRun(h, mm, 1111, WHEEL_AVERAGE_INTERVALS - WHEEL_MAGNETS);
         uint16_t speed = wSpeed(h, mm);
-        reportCheck("W02", wWithin(speed, 1111, 0.05),
-                    "8 -> 4 km/h: %u mm/s one turn later (want 1111 +-5 %%)", (unsigned)speed);
+        bool between = (WHEEL_AVERAGE_INTERVALS == WHEEL_MAGNETS) || (oneTurn < 2222 && oneTurn > speed);
+        bool ok = between && wWithin(speed, 1111, 0.02);
+        reportCheck("W02", ok, "8 -> 4 km/h: %u mm/s one turn later, %u after %u pulses (want 1111 +-2 %%)",
+                    (unsigned)oneTurn, (unsigned)speed, (unsigned)WHEEL_AVERAGE_INTERVALS);
     }
 
     // W03 - a late pulse brings the speed down smoothly, not in a step.
@@ -159,7 +166,9 @@ static void runWheelTests()
     // W07 - magnets glued on by hand are not evenly spaced. Averaging whole
     // turns is what cancels that, so the deviations here sum to one turn:
     // +10 % and -10 % in pairs, and with an odd count the last magnet in its
-    // true place (3 magnets: 1.10, 0.90, 1.00).
+    // true place (3 magnets: 1.10, 0.90, 1.00). Checked at every pulse from the
+    // first whole turn on - while the average builds up after a start, when it
+    // spans fewer gaps than WHEEL_AVERAGE_INTERVALS, as well as once it is full.
     {
         WHarness h; wFresh(h);
         double dev[WHEEL_MAGNETS];
@@ -168,21 +177,23 @@ static void runWheelTests()
             else if (i + 1 < WHEEL_MAGNETS) dev[i] = 1.10;
             else                           dev[i] = 1.00;
         }
-        uint64_t base = wGapUs(mm, 2222);
+        uint64_t base  = wGapUs(mm, 2222);
+        int      turns = WHEEL_AVERAGE_INTERVALS / WHEEL_MAGNETS + 3;
         bool ok = true;
-        uint16_t last = 0;
-        for (int turn = 0; turn < 4; turn++) {
+        uint16_t worst = 2222;
+        for (int turn = 0; turn < turns; turn++) {
             for (int i = 0; i < WHEEL_MAGNETS; i++) {
                 wAdvance(h, (uint64_t)(base * dev[i]));
                 wPulse(h);
-                if (turn >= 2) {
-                    last = wSpeed(h, mm);
-                    if (!wWithin(last, 2222, 0.02)) ok = false;
+                if (turn >= 1) {
+                    uint16_t speed = wSpeed(h, mm);
+                    if (fabs((double)speed - 2222.0) > fabs((double)worst - 2222.0)) worst = speed;
+                    if (!wWithin(speed, 2222, 0.005)) ok = false;
                 }
             }
         }
-        reportCheck("W07", ok, "magnets +-10 %% uneven: %u mm/s at every pulse of the last turns "
-                    "(want 2222 +-2 %%)", (unsigned)last);
+        reportCheck("W07", ok, "magnets +-10 %% uneven: at every pulse from the first whole turn, the furthest "
+                    "from 2222 mm/s was %u (want +-0.5 %%)", (unsigned)worst);
     }
 
     // W08 - the ISR's noise gate.
@@ -237,5 +248,54 @@ static void runWheelTests()
         uint16_t speed = wheelSpeedMmS(times, WHEEL_RING_SIZE, 10000000ULL, WHEEL_MM_PER_PULSE_MAX);
         reportCheck("W11", speed == UINT16_MAX,
                     "absurd speed clamps to %u mm/s (want %u)", (unsigned)speed, (unsigned)UINT16_MAX);
+    }
+
+    // W12 - a steady 8 km/h as the field gives it: every gap +-5 % at random
+    // (bumps, the wheel slipping) on top of the magnets +-10 % uneven, read
+    // every SEND_INTERVAL_MS as the seeder sends it, for two and a half minutes.
+    // The number on the work screen must hold within 3 % with the 15-gap
+    // average: the scatter of an average goes with one over the square root of
+    // the gaps in it, so a shorter WHEEL_AVERAGE_INTERVALS is allowed that much
+    // more. One turn's average with a single gap as the late-pulse reference -
+    // the rules until 28 September 2026 - read from -7.9 % to +4.2 % on these
+    // same pulses, and fails; so does WHEEL_AVERAGE_INTERVALS 3 today, and
+    // should - that is the twitch the longer average removed. The 15-gap
+    // average with the old single-gap reference still dipped to -8.3 %: most of
+    // the downward twitch was the late-pulse rule.
+    {
+        WHarness h; wFresh(h);
+        uint32_t rng  = 0x13579BDFu;              // fixed seed: a failure repeats exactly
+        uint64_t base = wGapUs(mm, 2222);
+        uint64_t next = h.nowUs + base;
+        uint64_t end  = h.nowUs + 150000000ULL;
+        uint32_t pulses = 0, samples = 0;
+        uint16_t lo = UINT16_MAX, hi = 0;
+        uint64_t sampleAt = h.nowUs;
+        while (h.nowUs < end) {
+            if (next <= sampleAt) {
+                h.nowUs = next;
+                wPulse(h);
+                rng = rng * 1664525u + 1013904223u;
+                double scatter = 1.0 + 0.05 * (2.0 * (double)(rng >> 8) / 16777216.0 - 1.0);
+                double magnet  = (pulses % WHEEL_MAGNETS == 0) ? 1.10 : (pulses % WHEEL_MAGNETS == 1) ? 0.90 : 1.00;
+                next += (uint64_t)((double)base * magnet * scatter);
+                pulses++;
+                continue;
+            }
+            h.nowUs = sampleAt;
+            if (pulses > (uint32_t)WHEEL_AVERAGE_INTERVALS + WHEEL_MAGNETS) {   // the average full
+                uint16_t speed = wSpeed(h, mm);
+                if (speed < lo) lo = speed;
+                if (speed > hi) hi = speed;
+                samples++;
+            }
+            sampleAt += (uint64_t)SEND_INTERVAL_MS * 1000ULL;
+        }
+        double limit = 0.03 * sqrt(15.0 / (double)WHEEL_AVERAGE_INTERVALS);
+        bool ok = samples > 500 && wWithin(lo, 2222, limit) && wWithin(hi, 2222, limit);
+        reportCheck("W12", ok, "8 km/h, gaps +-5 %% at random: %lu readings from %u to %u mm/s "
+                    "(%+.1f %% .. %+.1f %%, want within %.1f %%)", (unsigned long)samples, (unsigned)lo,
+                    (unsigned)hi, 100.0 * ((double)lo - 2222.0) / 2222.0, 100.0 * ((double)hi - 2222.0) / 2222.0,
+                    100.0 * limit);
     }
 }

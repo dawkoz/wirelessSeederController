@@ -12,6 +12,8 @@
 // count come in through DispenserInputs.
 // ---------------------------------------------------------------------------
 
+// The continuous calibration run's length. The burst-mode run has its own,
+// set by the dose and the calibration (calibrationBurstEdges).
 static constexpr uint32_t CALIBRATION_TOTAL_EDGES =
     (uint32_t)CALIBRATION_REVOLUTIONS * ENCODER_EDGES_PER_REV;
 
@@ -68,9 +70,11 @@ struct DispenserLogic {
     // Calibration run bookkeeping. calibrationArmed is what stops a run from
     // starting by itself after a reboot, a link gap, a clog or a cancel: it
     // is only set by a received command with calibrationRun == 0, and cleared
-    // when a run actually starts (or is refused).
+    // when a run actually starts (or is refused). calibrationStartMs is when
+    // the burst-mode run's replayed pass began (calibrationBurst).
     bool     calibrationArmed = false;
     uint32_t calibrationStartEdges = 0;
+    uint32_t calibrationStartMs    = 0;
 
     // Tractor command counters (see TractorCommand). lastCommandUpTimeMs is
     // how a tractor reboot is told apart from a fresh counter value.
@@ -133,6 +137,7 @@ inline void dispenserInit(DispenserLogic &logic, uint32_t nowMs, uint32_t edges)
     logic.progress          = 0;
     logic.calibrationArmed  = false;
     logic.calibrationStartEdges = 0;
+    logic.calibrationStartMs    = 0;
     logic.lastClearSeq      = 0;
     logic.lastUnclogSeq     = 0;
     logic.lastCommandUpTimeMs = 0;
@@ -396,16 +401,32 @@ inline uint16_t burstDuty(const DispenserLogic &logic)
     return logic.burstPermille;
 }
 
+// The angle one wheel pulse's burst turns, in output-shaft revolutions: the
+// tractor's angle factor, in thousandths of what the motor turns at full burst
+// PWM - taken as BURST_ANGLE_REFERENCE_RPM at this logic's burstPermille - in
+// the time between two pulses at BURST_ANGLE_REFERENCE_SPEED_MM_S. The factor
+// is calibrated by weighing, so the reference only makes it scale the bursts.
+// The distance per pulse is in both the reference and the ground a pulse
+// stands for, so one factor holds for either seed size. At 1571 mm, full PWM
+// and a factor of 500: 1.41 turns. Every wire value is taken, even past the
+// tractor's 999.
+inline float burstRevsPerPulse(const DispenserLogic &logic, const DispenserInputs &in)
+{
+    float mm       = (float)validWheelMmPerPulse(in.command.wheelMmPerPulse);
+    float refRevs  = (float)BURST_ANGLE_REFERENCE_RPM * ((float)logic.burstPermille / 1000.0f) / 60.0f *
+                     mm / (float)BURST_ANGLE_REFERENCE_SPEED_MM_S;
+    return (float)in.command.burstAngleFactor / 1000.0f * refRevs;
+}
+
 // Burst metering, for a motor that cannot turn the loaded auger slowly: every
 // wheel pulse is dosed as one burst at the burst PWM (burstDuty), which ends
-// when the encoder has counted that pulse's share of the ground. A pulse is a
-// fixed distance and a fixed distance is a fixed number of shaft turns, so the
-// dose per metre is exactly what the continuous rate gives - delivered in one
-// go per pulse, just after the ground it belongs to. The PWM only sets how long
-// each burst takes.
+// when the encoder has counted that pulse's angle (burstRevsPerPulse). A pulse
+// is a fixed distance, so a fixed angle per pulse is a fixed dose per metre -
+// delivered in one go per pulse, just after the ground it belongs to. The PWM
+// only sets how long each burst takes.
 //
 // It is the distance ledger with the rate taken out: owedRevolutions is the
-// turns owed to the ground, each pulse adds its share, the encoder takes off
+// turns owed to the ground, each pulse adds its angle, the encoder takes off
 // what was turned, and the motor runs flat out while anything worth a burst is
 // owed. The overshoot of a burst - the motor braking to a stop past its count -
 // is owed back by the next one, so it never adds up over a pass.
@@ -425,10 +446,8 @@ inline uint16_t burstDuty(const DispenserLogic &logic)
 // have found the motor still more than BURST_LATE_FRACTION of a pulse behind on
 // the earlier ones.
 inline DispenserFault burstMeter(DispenserLogic &logic, const DispenserInputs &in,
-                                 float revsPerMetre, DispenserOutputs &next)
+                                 float revsPerPulse, DispenserOutputs &next)
 {
-    uint16_t mmPerPulse   = validWheelMmPerPulse(in.command.wheelMmPerPulse);
-    float    revsPerPulse = revsPerMetre * (float)mmPerPulse / 1000.0f;
     uint32_t pulses       = in.telemetry.wheelPulses;
     uint32_t edges        = in.encoderEdges;
 
@@ -526,6 +545,57 @@ inline bool dispenserBurstStop(DispenserLogic &logic, uint32_t encoderEdges, Dis
     return true;
 }
 
+// The encoder edges the first `pulses` pulses of the burst-mode calibration run
+// ask for: what burstMeter() turns for that many pulses in work, at the angle
+// factor and distance per pulse the tractor is sending now - 0 if the factor is
+// 0. Worked out for the whole count at once, so the rounding of one pulse never
+// adds up over the run; capped far past anything real, as in burstMeter(), to
+// stay in range of dispenserBurstStop().
+inline uint32_t calibrationBurstEdges(const DispenserLogic &logic, const DispenserInputs &in, uint32_t pulses)
+{
+    float edges = burstRevsPerPulse(logic, in) * (float)pulses * (float)ENCODER_EDGES_PER_REV;
+    if (edges > 1.0e9f) edges = 1.0e9f;
+    return (uint32_t)(edges + 0.5f);
+}
+
+// One step of the calibration run in burst mode, which fires real bursts
+// without moving: CALIBRATION_PULSES pulses, one every distance-per-pulse at
+// CALIBRATION_SPEED_MM_S - the first as the run starts - each asking for the
+// angle one pulse asks for in work, and the motor doing with them what
+// burstMeter() does with real ones: a burst at the burst PWM to each pulse's
+// exact count (dispenserBurstStop()), carrying straight on when the next pulse
+// is due before one is done, off in between. So what the operator weighs is
+// what CALIBRATION_PULSES pulses deliver in work. Unlike burstMeter() nothing is
+// ever dropped, however far behind the motor falls: every pulse is turned in
+// full, or the weight would come out short. Each burst ends on the whole
+// count so far, so the braking of one is taken off the next and the run ends
+// on calibrationBurstEdges() for all the pulses. The pulses due are worked out
+// from the clock and the turns done from the encoder, so no burst can go
+// missing or run twice. Returns true when the shaft has clogged.
+inline bool calibrationBurst(DispenserLogic &logic, const DispenserInputs &in, uint32_t turned,
+                             DispenserOutputs &next)
+{
+    uint32_t mmPerPulse = validWheelMmPerPulse(in.command.wheelMmPerPulse);
+    uint32_t intervalMs = mmPerPulse * 1000 / CALIBRATION_SPEED_MM_S;
+    uint32_t pulses     = 1 + (in.nowMs - logic.calibrationStartMs) / intervalMs;
+    if (pulses > CALIBRATION_PULSES) pulses = CALIBRATION_PULSES;
+    uint32_t due = calibrationBurstEdges(logic, in, pulses);
+
+    if (turned >= due) {
+        // Between two pulses: motor off, which also stops the clog timer.
+        logic.burstRunning = false;
+        logic.targetRPM    = 0;
+        return burstClogDetected(logic, in.nowMs, 0);
+    }
+
+    logic.burstRunning   = true;
+    logic.burstStopEdges = logic.calibrationStartEdges + due;
+    logic.targetRPM      = burstNominalRPM(logic);
+    next.motorPermille   = burstDuty(logic);
+    next.motorForward    = true;
+    return burstClogDetected(logic, in.nowMs, next.motorPermille);
+}
+
 // One control step. Returns false (with out untouched) until
 // MOTOR_CONTROL_INTERVAL_MS has passed since the previous step or since
 // dispenserInit; otherwise runs exactly one step with that elapsed time.
@@ -591,6 +661,7 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
                 } else {
                     newMode = DispenserMode::Calibrating;
                     logic.calibrationStartEdges = in.encoderEdges;
+                    logic.calibrationStartMs    = in.nowMs;
                     logic.progress = 0;
                 }
                 break;
@@ -614,12 +685,15 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
             if (logic.burstMode) {
                 // Pulses, not speed: a machine standing still sends none, so
                 // nothing is turned (see burstMeter). Only nothing to dose stops
-                // it outright.
-                if (dose == 0 || calib == 0) {
+                // it outright: the dispenser switched off, a dose of 0, or an
+                // angle factor of 0. The dose's size is the tractor's business
+                // here - it is in the angle factor - so only whether there is
+                // one matters, and the grams-per-100 calibration not at all.
+                if (dose == 0 || in.command.burstAngleFactor == 0) {
                     resetController(logic);
                     break;
                 }
-                newFault = burstMeter(logic, in, revolutionsPerMetre(dose, calib), next);
+                newFault = burstMeter(logic, in, burstRevsPerPulse(logic, in), next);
                 if (burstClogDetected(logic, in.nowMs, next.motorPermille)) {
                     // As below: motor off, and the reset and progress come with
                     // the mode change.
@@ -698,24 +772,22 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
                 newMode = DispenserMode::Refused;
                 break;
             }
+            // Continuous: 100 revolutions. Burst mode: CALIBRATION_PULSES
+            // pulses' worth at the angle factor being checked - done at once
+            // if it is 0, since there is nothing to turn.
             uint32_t turned = in.encoderEdges - logic.calibrationStartEdges;
-            if (turned >= CALIBRATION_TOTAL_EDGES) {
+            uint32_t total  = logic.burstMode ? calibrationBurstEdges(logic, in, CALIBRATION_PULSES)
+                                              : CALIBRATION_TOTAL_EDGES;
+            if (turned >= total) {
                 newMode = DispenserMode::CalibrationDone;
                 logic.progress = 100;
                 break;
             }
-            logic.progress  = (uint8_t)(((uint64_t)turned * 100ULL) / CALIBRATION_TOTAL_EDGES);
+            logic.progress  = (uint8_t)(((uint64_t)turned * 100ULL) / total);
             bool clogged;
             if (logic.burstMode) {
-                // At the burst PWM, the way the auger turns in work, and
-                // stopped on the exact count by dispenserBurstStop() - the next
-                // step then finds it done.
-                logic.targetRPM      = burstNominalRPM(logic);
-                logic.burstRunning   = true;
-                logic.burstStopEdges = logic.calibrationStartEdges + CALIBRATION_TOTAL_EDGES;
-                next.motorPermille   = burstDuty(logic);
-                next.motorForward    = true;
-                clogged = burstClogDetected(logic, in.nowMs, next.motorPermille);
+                // Real bursts, the way the auger turns in work.
+                clogged = calibrationBurst(logic, in, turned, next);
             } else {
                 logic.targetRPM = CALIBRATION_RPM;
                 next.motorPermille = computeDuty(logic, logic.targetRPM, elapsed);

@@ -525,8 +525,8 @@ to fit it, and asks you to remove it before it does anything else.
 
 | Keys | What you need | What it proves |
 |---|---|---|
-| `d` | nothing connected | the decision logic and the distance ledger, 35 + 12 checks, and burst metering, 28 more (B01–B28, bursts at full and at half PWM) — a second or two |
-| `w` | nothing connected | ground speed from wheel pulses (the seeder's own logic), 11 checks |
+| `d` | nothing connected | the decision logic and the distance ledger, 35 + 12 checks, and burst metering, 30 more (B01–B30: bursts at full and at half PWM, the calibration run, and the whole weigh-and-correct procedure through the tractor's angle-factor arithmetic) — a second or two |
+| `w` | nothing connected | ground speed from wheel pulses (the seeder's own logic), 12 checks — W12 is how steady the averaged speed stays with scattered gaps |
 | `v` | nothing connected | packet validation, the inbox and the link timing |
 | `h` | coupling off, shaft free to turn | supply, driver, motor, both encoder channels, DIR, radio |
 | `m` | coupling off, shaft free | metering and every link-loss case, with the motor running; M11 checks the turns delivered over simulated ground |

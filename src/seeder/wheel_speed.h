@@ -5,9 +5,10 @@
 // ---------------------------------------------------------------------------
 // Ground speed from the ground-wheel pulses.
 //
-// The speed is the distance covered by the last few gaps between pulses,
-// divided by the time they took, so it changes smoothly rather than in steps.
-// Nothing in here touches hardware, so it can be tested on a PC.
+// The speed is the distance covered by the last WHEEL_AVERAGE_INTERVALS gaps
+// between pulses - five turns of the drive - divided by the time they took, so
+// it changes smoothly rather than in steps. Nothing in here touches hardware,
+// so it can be tested on a PC.
 // ---------------------------------------------------------------------------
 
 static constexpr uint8_t WHEEL_RING_SIZE = WHEEL_AVERAGE_INTERVALS + 1;
@@ -68,6 +69,12 @@ inline uint16_t wheelSpeedMmS(const uint64_t recentUs[], uint8_t count, uint64_t
     }
     if (gaps == 0) return 0;
 
+    // Whole turns of the drive only - the newest ones - as soon as there is
+    // one, so uneven spacing between the magnets cancels out while the average
+    // builds up after a start too, not just once it spans all
+    // WHEEL_AVERAGE_INTERVALS (itself whole turns).
+    if (gaps >= WHEEL_MAGNETS) gaps -= gaps % WHEEL_MAGNETS;
+
     uint64_t spanUs = recentUs[0] - recentUs[gaps];
     if (spanUs == 0) return 0;
 
@@ -75,20 +82,24 @@ inline uint16_t wheelSpeedMmS(const uint64_t recentUs[], uint8_t count, uint64_t
 
     // If the next pulse is late, the wheel has slowed: lower the speed now
     // rather than holding it until the stop rule fires. Late means later than
-    // the gap between the same two magnets one wheel turn ago, so uneven
-    // magnet spacing can't cause a false drop. Before the first full turn,
-    // the newest gap is the only reference there is.
+    // the longest gap in the average. Every pair of magnets is in there, so
+    // uneven spacing can't cause a false drop - and neither can the ordinary
+    // scatter of one gap against the next, which with a single gap as the
+    // reference pulled the speed down for a moment in about every other gap,
+    // and the number on the work screen twitched with it.
     //
     // The two rules meet exactly: at a steady speed the decayed value reaches
     // WHEEL_MIN_SPEED_MM_S at the moment sinceLastUs reaches stopUs, so the
     // speed slides down to the stop instead of stepping to 0 from wherever it
     // happened to be.
-    uint64_t expectedUs = (gaps >= WHEEL_MAGNETS)
-        ? recentUs[WHEEL_MAGNETS - 1] - recentUs[WHEEL_MAGNETS]
-        : recentUs[0] - recentUs[1];
+    uint64_t longestUs = 0;
+    for (uint8_t i = 0; i < gaps; i++) {
+        uint64_t gapUs = recentUs[i] - recentUs[i + 1];
+        if (gapUs > longestUs) longestUs = gapUs;
+    }
 
-    if (sinceLastUs > expectedUs) {
-        speed = speed * expectedUs / sinceLastUs;
+    if (sinceLastUs > longestUs) {
+        speed = speed * longestUs / sinceLastUs;
     }
 
     return (speed > UINT16_MAX) ? UINT16_MAX : (uint16_t)speed;

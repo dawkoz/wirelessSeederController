@@ -55,6 +55,7 @@ struct SimTractor {
     // they do on the machine, where the tractor sends the number both boards
     // meter with.
     uint16_t wheelMmPerPulse  = BENCH_WHEEL_MM_PER_PULSE;
+    uint16_t burstAngleFactor = BENCH_ANGLE_FACTOR;
 
     // upTimeMs = bench time + this offset, so a test can make it go backwards
     // (a tractor reboot) by lowering it.
@@ -138,6 +139,7 @@ static int buildTractorPacket(const Injector &inj, uint32_t now, uint8_t *buf)
     packet.clogClearSeq     = inj.tractor.clogClearSeq;
     packet.unclogSeq        = inj.tractor.unclogSeq;
     packet.wheelMmPerPulse  = inj.tractor.wheelMmPerPulse;
+    packet.burstAngleFactor = inj.tractor.burstAngleFactor;
 
     memcpy(buf, &packet, sizeof(packet));
     return (int)sizeof(packet);

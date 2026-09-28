@@ -119,7 +119,8 @@ void setup()
     }
 
     dispenserInit(logic, millis(), encoderEdges());
-    Serial.println(DISPENSER_BURST_MODE ? "Dispenser module ready - burst metering, one full-duty burst per wheel pulse"
+    Serial.println(DISPENSER_BURST_MODE ? "Dispenser module ready - burst metering, one burst per wheel pulse, "
+                                          "its angle the tractor's angle factor"
                                         : "Dispenser module ready - continuous metering");
 }
 

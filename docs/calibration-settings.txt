@@ -34,7 +34,13 @@ HOW TO RESTORE
 
 WHAT THE VALUES ARE
     dose                the Dawka screen, kg/ha
-    dispenser calib     the Kalibracja screen, grams per 100 dispenser turns
+    dispenser calib     the Kalibracja screen with continuous metering, grams
+                        per 100 dispenser turns
+    angle factor        the Kalibracja screen with burst metering (0-999): the
+                        angle each wheel pulse's burst turns. Set by weighing
+                        the calibration run, and scaled with the dose. Blocks
+                        exported before 28 September 2026 have no such line -
+                        it came with protocol 6.
     dispenser           the Wl./Wyl. field on the Dawka screen
     tramlines           the Sciezki switch
     seed size           the Nasiona screen - which gear the machine is in

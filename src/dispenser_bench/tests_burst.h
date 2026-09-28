@@ -5,6 +5,7 @@
 #include "machine_settings.h"
 #include "espnow_protocol.h"
 #include "../dispenser/dispenser_logic.h"
+#include "../tractor/angle_factor.h"
 #include "bench_report.h"
 #include "bench_wheel.h"
 
@@ -23,11 +24,11 @@
 // what the pulses ask for, the motor is at full duty or off and nothing in
 // between, and the alarms say what they should.
 //
-// The defaults are the D tests' - 40 kg/ha, 500 g per 100 rev, 785 mm per
-// pulse, 1000 mm/s - so a pulse asks for 2.512 turns and the ground for an
-// average of 192 RPM, against a simulated shaft that turns at 300 RPM at full
-// duty. Bursts are at full PWM unless a test says otherwise, whatever
-// BURST_PWM_FRACTION is set to.
+// The defaults: the angle factor BENCH_ANGLE_FACTOR at 785 mm per pulse and
+// 1000 mm/s, so a pulse asks for 2.512 turns and the ground for an average of
+// 192 RPM - the D tests' 40 kg/ha at 500 g per 100 - against a simulated shaft
+// that turns at 300 RPM at full duty. Bursts are at full PWM unless a test says
+// otherwise, whatever BURST_PWM_FRACTION is set to.
 // ---------------------------------------------------------------------------
 
 static constexpr uint16_t B_FULL = 1000;   // full PWM, in permille
@@ -116,6 +117,7 @@ static void bFresh(BHarness &h)
     h.command.gramsPer100Rev   = 500;
     h.command.calibrationRun   = 0;
     h.command.wheelMmPerPulse  = h.mmPerPulse;
+    h.command.burstAngleFactor = BENCH_ANGLE_FACTOR;
     h.nextSendMs = h.nowMs;
 }
 
@@ -138,11 +140,15 @@ static void bWatch(BHarness &h)
 }
 
 // Turns per pulse at the harness's current settings, worked out independently
-// of the logic's own arithmetic.
+// of the logic's own arithmetic: the angle factor, in thousandths of what
+// BURST_ANGLE_REFERENCE_RPM at the harness's burst PWM turns between two pulses
+// at BURST_ANGLE_REFERENCE_SPEED_MM_S.
 static double bRevsPerPulse(const BHarness &h)
 {
-    return (double)WORKING_WIDTH_CM * (double)h.command.doseKgPerHa /
-           (10.0 * (double)h.command.gramsPer100Rev) * (double)h.mmPerPulse / 1000.0;
+    double pulseSeconds = (double)h.mmPerPulse / (double)BURST_ANGLE_REFERENCE_SPEED_MM_S;
+    double refRevs      = (double)BURST_ANGLE_REFERENCE_RPM * ((double)h.logic.burstPermille / 1000.0) / 60.0 *
+                          pulseSeconds;
+    return (double)h.command.burstAngleFactor / 1000.0 * refRevs;
 }
 
 static double bTurns(const BHarness &h, uint32_t sinceEdges)
@@ -437,7 +443,9 @@ static void testB04()
 }
 
 // ---------------------------------------------------------------------------
-// B05 - nothing to dose: nine cases, like D02, with the ground making pulses
+// B05 - nothing to dose: seven cases, like D02, with the ground making pulses.
+// The grams-per-100 calibration plays no part in burst mode - the angle factor
+// takes its place - so a calibration of 0 must not stop anything (f).
 // ---------------------------------------------------------------------------
 
 struct B05Case {
@@ -447,19 +455,22 @@ struct B05Case {
     bool     telemetry;
     uint8_t  enabled;
     uint16_t dose;
+    uint16_t factor;
     uint32_t grams;
+    bool     doses;         // the one case that does meter
     bool     noSpeedData;
 };
 
 static void testB05()
 {
     const B05Case cases[] = {
-        {"B05a", "(a) no packets",         false, false, 1, 40, 500, true },
-        {"B05b", "(b) command only",       true,  false, 1, 40, 500, true },
-        {"B05c", "(c) telemetry only",     false, true,  1, 40, 500, false},
-        {"B05d", "(d) enabled 0",          true,  true,  0, 40, 500, false},
-        {"B05e", "(e) dose 0",             true,  true,  1,  0, 500, false},
-        {"B05f", "(f) 0 g per 100 rev",    true,  true,  1, 40,   0, false},
+        {"B05a", "(a) no packets",           false, false, 1, 40, BENCH_ANGLE_FACTOR, 500, false, true },
+        {"B05b", "(b) command only",         true,  false, 1, 40, BENCH_ANGLE_FACTOR, 500, false, true },
+        {"B05c", "(c) telemetry only",       false, true,  1, 40, BENCH_ANGLE_FACTOR, 500, false, false},
+        {"B05d", "(d) enabled 0",            true,  true,  0, 40, BENCH_ANGLE_FACTOR, 500, false, false},
+        {"B05e", "(e) dose 0",               true,  true,  1,  0, BENCH_ANGLE_FACTOR, 500, false, false},
+        {"B05f", "(f) 0 g per 100: doses",   true,  true,  1, 40, BENCH_ANGLE_FACTOR,   0, true,  false},
+        {"B05g", "(g) angle factor 0",       true,  true,  1, 40, 0,                  500, false, false},
     };
 
     for (uint8_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
@@ -470,7 +481,16 @@ static void testB05()
         h.seederOn     = cases[c].telemetry;
         h.command.dispenserEnabled = cases[c].enabled;
         h.command.doseKgPerHa      = cases[c].dose;
+        h.command.burstAngleFactor = cases[c].factor;
         h.command.gramsPer100Rev   = cases[c].grams;
+
+        if (cases[c].doses) {
+            bRun(h, 5000);
+            bool ok = h.bursts > 0 && h.logic.fault == DispenserFault::None;
+            reportCheck(cases[c].id, ok, "%s: %lu bursts in 5 s of pulses", cases[c].label,
+                        (unsigned long)h.bursts);
+            continue;
+        }
 
         bool ok = true;
         for (int i = 0; i < 5000; i++) {
@@ -796,8 +816,34 @@ static void testB12()
                 (unsigned)(BURST_CLOG_MIN_RPM - 20), clogged ? "yes" : "NO");
 }
 
+// What the model's shaft settles at for a duty, load included.
+static double bSteadyRPM(const BHarness &h, uint16_t permille)
+{
+    double rpm = h.runRPM * (double)permille / 1000.0 - h.droopRPM;
+    return (rpm > 0.0) ? rpm : 0.0;
+}
+
+// Into a burst at speed, with a step at speed behind it: every burst's first
+// step measures the standstill before it and starts the clog timer, and a hold
+// before the next step would be timed from there, not from the hold.
+static bool bUntilBurstSettled(BHarness &h, uint32_t limitMs)
+{
+    for (uint32_t i = 0; i < limitMs; i++) {
+        bTick(h);
+        if (h.out.motorPermille > 0 && h.shaftRPM >= 0.9 * bSteadyRPM(h, h.out.motorPermille) &&
+            !h.logic.clogTimerRunning) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
-// B13 - the calibration run: full duty, stopped on the exact count
+// B13 - the calibration run fires CALIBRATION_PULSES real bursts, spaced as at
+// CALIBRATION_SPEED_MM_S. With 2.5 m per pulse a pulse is due every 1.5 s, and
+// an angle factor of 889 asks for 4.0 turns a pulse - 0.8 s at 300
+// RPM - so every burst is separate: each starts within a control step of its
+// pulse, each turns one pulse's angle, and the run stops on the exact count
 // ---------------------------------------------------------------------------
 
 // Arms and starts a run with no seeder, as D20 does. True once it is running.
@@ -813,18 +859,65 @@ static bool bStartCalibration(BHarness &h)
     return false;
 }
 
+// The calibration run's pulse interval for a distance per pulse, as the logic
+// works it out.
+static uint32_t bCalibIntervalMs(uint16_t mmPerPulse)
+{
+    return (uint32_t)mmPerPulse * 1000 / CALIBRATION_SPEED_MM_S;
+}
+
+// What the calibration run turns in all: CALIBRATION_PULSES pulses at the
+// harness's angle factor, burst PWM and distance, worked out independently of
+// the logic.
+static double bCalibWantEdges(const BHarness &h)
+{
+    return (double)CALIBRATION_PULSES * bRevsPerPulse(h) * (double)ENCODER_EDGES_PER_REV;
+}
+
+// Runs a started calibration to its end. True when it ended in CalibrationDone.
+static bool bCalibrateToEnd(BHarness &h, uint32_t limitMs)
+{
+    for (uint32_t i = 0; i < limitMs; i++) {
+        bTick(h);
+        if (h.logic.mode != DispenserMode::Calibrating) break;
+    }
+    return h.logic.mode == DispenserMode::CalibrationDone;
+}
+
 static void testB13()
 {
     BHarness h;
     bFresh(h);
+    h.mmPerPulse            = 2500;
+    h.command.burstAngleFactor = 889;       // 4.0 turns a pulse at 2.5 m
     bool started = bStartCalibration(h);
-    uint32_t tStart = h.nowMs;
+    uint32_t interval = bCalibIntervalMs(h.mmPerPulse);
+    uint32_t pulseEdges = (uint32_t)(bRevsPerPulse(h) * (double)ENCODER_EDGES_PER_REV + 0.5);   // 1920
 
-    bool    ok = started;
-    bool    sawDone = false;
-    uint8_t lastProgress = 0;
-    for (int i = 0; i < 60000; i++) {
+    bool     ok = started;
+    bool     sawDone = false;
+    uint8_t  lastProgress = 0;
+    uint32_t bursts = 0;
+    bool     wasOn = false;
+    bool     onTime = true;                   // each burst within a step of its pulse
+    uint32_t prevStartEdges = h.edges;
+    uint32_t worstShare = 0, leastShare = 0xFFFFFFFFu;
+    for (int i = 0; i < 120000; i++) {
         bTick(h);
+        bool on = h.out.motorPermille > 0;
+        if (on && !wasOn) {
+            uint32_t since = h.nowMs - h.logic.calibrationStartMs;
+            uint32_t pulse = bursts * interval;
+            if (since < pulse || since > pulse + MOTOR_CONTROL_INTERVAL_MS + 1) onTime = false;
+            if (bursts > 0) {                 // the edges since the last burst began: one share
+                uint32_t share = h.edges - prevStartEdges;
+                if (share > worstShare) worstShare = share;
+                if (share < leastShare) leastShare = share;
+            }
+            prevStartEdges = h.edges;
+            bursts++;
+        }
+        wasOn = on;
         if (h.logic.mode == DispenserMode::Calibrating) {
             if (h.logic.progress < lastProgress) ok = false;
             lastProgress = h.logic.progress;
@@ -836,31 +929,39 @@ static void testB13()
             break;
         }
     }
-    uint32_t took = h.nowMs - tStart;
+    uint32_t took = h.nowMs - h.logic.calibrationStartMs;
     bRun(h, 1000);                            // let it brake, and hold
 
-    uint32_t turned = h.edges - h.logic.calibrationStartEdges;
-    bool edgesOk = turned >= CALIBRATION_TOTAL_EDGES && turned <= CALIBRATION_TOTAL_EDGES + 20;
-    ok = ok && sawDone && edgesOk && !h.oddDuty && (h.logic.progress == 100)
-            && (h.out.motorPermille == 0) && (h.logic.mode == DispenserMode::CalibrationDone);
+    uint32_t turned  = h.edges - h.logic.calibrationStartEdges;
+    double   want    = bCalibWantEdges(h);
+    bool     edgesOk = (double)turned >= want - 1.0 && (double)turned <= want + 20.0;
+    bool     sharesOk = (CALIBRATION_PULSES < 2) ||
+                        (leastShare + 20 >= pulseEdges && worstShare <= pulseEdges + 20);
+    if (leastShare > worstShare) leastShare = worstShare = 0;   // one burst: no share between two to measure
+    ok = ok && sawDone && edgesOk && onTime && sharesOk && bursts == CALIBRATION_PULSES && !h.oddDuty
+            && (h.logic.progress == 100) && (h.out.motorPermille == 0)
+            && (h.logic.mode == DispenserMode::CalibrationDone);
 
-    reportCheck("B13", ok, "calibration at full duty: Done after %lu ms, %lu edges (want %lu..%lu), "
-                "progress 100 %s, motor off %s",
-                (unsigned long)took, (unsigned long)turned, (unsigned long)CALIBRATION_TOTAL_EDGES,
-                (unsigned long)(CALIBRATION_TOTAL_EDGES + 20), (h.logic.progress == 100) ? "yes" : "NO",
-                (h.out.motorPermille == 0) ? "yes" : "NO");
+    reportCheck("B13", ok, "calibration, %u pulses %lu ms apart: %lu bursts, each within a step of its pulse %s, "
+                "%lu..%lu edges each (want %lu +-20), Done after %lu ms, %lu edges (want %.0f)",
+                (unsigned)CALIBRATION_PULSES, (unsigned long)interval,
+                (unsigned long)bursts, onTime ? "yes" : "NO", (unsigned long)leastShare,
+                (unsigned long)worstShare, (unsigned long)pulseEdges, (unsigned long)took,
+                (unsigned long)turned, want);
 }
 
 // ---------------------------------------------------------------------------
-// B14 - a clog during the calibration run
+// B14 - a clog during the calibration run: blocked in the middle of a burst
 // ---------------------------------------------------------------------------
 
 static void testB14()
 {
     BHarness h;
     bFresh(h);
+    h.mmPerPulse          = 2500;             // separate bursts, as in B13
+    h.command.burstAngleFactor = 889;
     bool started = bStartCalibration(h);
-    bRun(h, 3000);
+    bool inBurst = bUntilBurstSettled(h, 5000);   // the first burst: there is one whatever the pulse count
 
     h.blocked = true;
     uint32_t t0 = h.nowMs;
@@ -874,13 +975,15 @@ static void testB14()
     }
     uint32_t tClog = h.nowMs - t0;
 
-    bool ok = started && clogged && tClog <= CLOG_DETECT_MS + 2 * MOTOR_CONTROL_INTERVAL_MS;
-    reportCheck("B14", ok, "blocked during calibration: Clogged with the motor off after %lu ms %s",
-                (unsigned long)tClog, clogged ? "yes" : "NO");
+    bool ok = started && inBurst && clogged && tClog >= CLOG_DETECT_MS
+           && tClog <= CLOG_DETECT_MS + 2 * MOTOR_CONTROL_INTERVAL_MS;
+    reportCheck("B14", ok, "blocked in a calibration burst: Clogged with the motor off after %lu ms (want %lu..%lu) %s",
+                (unsigned long)tClog, (unsigned long)CLOG_DETECT_MS,
+                (unsigned long)(CLOG_DETECT_MS + 2 * MOTOR_CONTROL_INTERVAL_MS), clogged ? "yes" : "NO");
 }
 
 // ---------------------------------------------------------------------------
-// B15 - a dose so small that a pulse asks for less than BURST_MIN_EDGES: it
+// B15 - an angle so small that a pulse asks for less than BURST_MIN_EDGES: it
 // waits for a few pulses and then goes, and nothing is lost
 // ---------------------------------------------------------------------------
 
@@ -888,8 +991,7 @@ static void testB15()
 {
     BHarness h;
     bFresh(h);
-    h.command.doseKgPerHa    = 1;
-    h.command.gramsPer100Rev = 5000;          // 3 edges a pulse
+    h.command.burstAngleFactor = 4;           // 2.7 edges a pulse
     uint32_t e0, p0;
     bStart(h, e0, p0);
     bool reached = bRunPulses(h, 200, 400000);
@@ -910,8 +1012,10 @@ static void testB15()
 }
 
 // ---------------------------------------------------------------------------
-// B16 - the dose changes mid-pass: each pulse is dosed at the dose in force
-// when it came
+// B16 - the angle factor changes mid-pass, as the tractor changes it when the
+// dose is doubled: each pulse is dosed at the factor in force when it came.
+// The dose itself changes nothing here - in burst mode it only says whether
+// to dose at all - which the second half checks.
 // ---------------------------------------------------------------------------
 
 static void testB16()
@@ -923,20 +1027,32 @@ static void testB16()
     bRunPulses(h, 30, 60000);
     bUntilIdle(h, 5000);
 
-    double   perPulse40 = bRevsPerPulse(h);
-    uint32_t pMid       = h.logic.ledgerPulses;
-    h.command.doseKgPerHa = 80;               // at 500 mm/s that asks for 192 RPM, as before
+    double   perPulseA = bRevsPerPulse(h);
+    uint32_t pMid      = h.logic.ledgerPulses;
+    h.command.burstAngleFactor = 2 * BENCH_ANGLE_FACTOR;   // at 500 mm/s that asks for 192 RPM, as before
     h.speedMmS = 500.0;
-    double   perPulse80 = bRevsPerPulse(h);
+    double   perPulseB = bRevsPerPulse(h);
 
     bRunPulses(h, 30, 120000);
     bFinish(h);
 
-    double want = (double)(pMid - p0) * perPulse40 + (double)(h.logic.ledgerPulses - pMid) * perPulse80;
+    double want = (double)(pMid - p0) * perPulseA + (double)(h.logic.ledgerPulses - pMid) * perPulseB;
     double got  = bTurns(h, e0);
     bool   ok   = bAddsUp(got, want) && !h.sawOverSpeed;
 
-    reportCheck("B16", ok, "dose 40 -> 80 kg/ha mid-pass: %.2f turns (want %.2f +-0.1)", got, want);
+    // The dose doubled, the factor not: the same angle a pulse.
+    BHarness d;
+    bFresh(d);
+    d.command.doseKgPerHa = 80;
+    uint32_t de0, dp0;
+    bStart(d, de0, dp0);
+    bRunPulses(d, 20, 60000);
+    bFinish(d);
+    double dWant = (double)(d.logic.ledgerPulses - dp0) * bRevsPerPulse(d);
+    bool   doseOk = bAddsUp(bTurns(d, de0), dWant);
+
+    reportCheck("B16", ok && doseOk, "angle factor doubled mid-pass: %.2f turns (want %.2f +-0.1); the dose "
+                "doubled with the factor unchanged: the same angle a pulse %s", got, want, doseOk ? "yes" : "NO");
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,19 +1245,21 @@ static void testB22()
 }
 
 // ---------------------------------------------------------------------------
-// B23 - the far ends of what the wire can carry: a dose no tractor sends, at
-// the longest distance per pulse. The motor must simply run flat out with ZA
-// SZYBKO - never stop because a count overflowed or wrapped.
+// B23 - the far ends of what the wire can carry: an angle factor and a dose no
+// tractor sends, at the longest distance per pulse - 590 turns a pulse. The
+// motor must simply run flat out with ZA SZYBKO - never stop because a count
+// overflowed or wrapped.
 // ---------------------------------------------------------------------------
 
 static void testB23()
 {
     BHarness h;
     bFresh(h);
-    h.command.doseKgPerHa    = 65535;
-    h.command.gramsPer100Rev = 1;
-    h.mmPerPulse             = WHEEL_MM_PER_PULSE_MAX;
-    h.speedMmS               = 2000.0;
+    h.command.burstAngleFactor = 65535;
+    h.command.doseKgPerHa      = 65535;
+    h.command.gramsPer100Rev   = 1;
+    h.mmPerPulse               = WHEEL_MM_PER_PULSE_MAX;
+    h.speedMmS                 = 2000.0;
 
     // A pulse every 2.5 s, and ZA SZYBKO needs two of them to find the motor a
     // whole pulse behind: the fourth pulse, at about 10 s.
@@ -1161,7 +1279,7 @@ static void testB23()
            && h.logic.burstRunning && ahead > 0 && ahead <= 1000000001
            && h.worstOwedRev <= cap * 1.0001;
 
-    reportCheck("B23", ok, "65535 kg/ha at 1 g per 100 rev: flat out from the first pulse %s, ZA SZYBKO %s, "
+    reportCheck("B23", ok, "angle factor 65535 at 5 m a pulse: flat out from the first pulse %s, ZA SZYBKO %s, "
                 "stop count %ld edges ahead (limit 1e9)",
                 flatOut ? "yes" : "NO", (h.logic.fault == DispenserFault::OverSpeed) ? "yes" : "NO",
                 (long)ahead);
@@ -1183,13 +1301,6 @@ static void bHalfPwm(BHarness &h)
     h.logic.burstPermille = B_HALF;
     h.runRPM   = 347.0;
     h.speedMmS = 600.0;
-}
-
-// What the model's shaft settles at for a duty, load included.
-static double bSteadyRPM(const BHarness &h, uint16_t permille)
-{
-    double rpm = h.runRPM * (double)permille / 1000.0 - h.droopRPM;
-    return (rpm > 0.0) ? rpm : 0.0;
 }
 
 // The shaft's speed while the motor was driven - spin-up included.
@@ -1259,22 +1370,6 @@ static void testB25()
 // under the clog line of 54. The stall push gives it full PWM whenever it slows
 // under the line, so it keeps turning, is never called clogged, and the dose is
 // exact. Held for good, full PWM is tried and it clogs after CLOG_DETECT_MS.
-
-// Into a burst at speed, with a step at speed behind it: every burst's first
-// step measures the standstill before it and starts the clog timer, and a hold
-// before the next step would be timed from there, not from the hold.
-static bool bUntilBurstSettled(BHarness &h, uint32_t limitMs)
-{
-    for (uint32_t i = 0; i < limitMs; i++) {
-        bTick(h);
-        if (h.out.motorPermille > 0 && h.shaftRPM >= 0.9 * bSteadyRPM(h, h.out.motorPermille) &&
-            !h.logic.clogTimerRunning) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static void testB26()
 {
     BHarness h;
@@ -1328,24 +1423,18 @@ static void testB27()
     bHalfPwm(h);
     bool started = bStartCalibration(h);
     bWatch(h);
-
-    bool done = false;
-    for (int i = 0; i < 120000 && !done; i++) {
-        bTick(h);
-        done = (h.logic.mode != DispenserMode::Calibrating);
-    }
-    done = done && (h.logic.mode == DispenserMode::CalibrationDone);
+    bool done = bCalibrateToEnd(h, 120000);
     double rpm = bBurstRPM(h);
     bRun(h, 1000);
 
     uint32_t turned  = h.edges - h.logic.calibrationStartEdges;
-    bool     edgesOk = turned >= CALIBRATION_TOTAL_EDGES && turned <= CALIBRATION_TOTAL_EDGES + 20;
+    double   want    = bCalibWantEdges(h);
+    bool     edgesOk = (double)turned >= want - 1.0 && (double)turned <= want + 20.0;
     bool     ok      = started && done && edgesOk && !h.oddDuty && h.logic.progress == 100;
 
     reportCheck("B27", ok, "calibration at half PWM: every step at %u permille %s, %.0f RPM, %lu edges "
-                "(want %lu..%lu), Done %s",
-                (unsigned)B_HALF, h.oddDuty ? "NO" : "yes", rpm, (unsigned long)turned,
-                (unsigned long)CALIBRATION_TOTAL_EDGES, (unsigned long)(CALIBRATION_TOTAL_EDGES + 20),
+                "(want %.0f), Done %s",
+                (unsigned)B_HALF, h.oddDuty ? "NO" : "yes", rpm, (unsigned long)turned, want,
                 done ? "yes" : "NO");
 }
 
@@ -1389,6 +1478,121 @@ static void testB28()
                 (unsigned)lineHalf, (unsigned)line364);
 }
 
+// B29 - a calibration run far beyond the motor: 785 mm per pulse at 6 km/h is
+// a pulse every 471 ms, and at the tractor's largest angle factor, 999, a pulse
+// asks for 1.41 turns - 0.85 s for an auger so heavy that the motor turns it at
+// 100 RPM. In work the backlog would hit its cap after a few pulses and the
+// rest be dropped (ZA SZYBKO); here every pulse's angle is turned in full, in
+// one burst from start to finish, or the weight would come out short.
+static void testB29()
+{
+    BHarness h;
+    bFresh(h);                                 // 785 mm per pulse
+    h.command.burstAngleFactor = 999;
+    h.runRPM = 100.0;
+    bool started = bStartCalibration(h);
+    bWatch(h);
+    bool done = bCalibrateToEnd(h, 120000);
+    uint32_t took = h.nowMs - h.logic.calibrationStartMs;
+    bRun(h, 1000);
+
+    uint32_t turned  = h.edges - h.logic.calibrationStartEdges;
+    double   want    = bCalibWantEdges(h);
+    uint32_t fastest = (uint32_t)(want / (double)ENCODER_EDGES_PER_REV * 60000.0 / h.runRPM);
+    bool ok = started && done && h.bursts == 1 && !h.oddDuty && took <= fastest + 500
+           && (double)turned >= want - 1.0 && (double)turned <= want + 20.0;
+
+    reportCheck("B29", ok, "a pulse every %lu ms, %.1f turns each - far more than the motor can: %lu burst(s) "
+                "(want 1), all %.1f turns turned (%lu edges, want %.0f), Done after %lu ms (motor alone: %lu)",
+                (unsigned long)bCalibIntervalMs(h.mmPerPulse), bRevsPerPulse(h), (unsigned long)h.bursts,
+                want / (double)ENCODER_EDGES_PER_REV, (unsigned long)turned, want, (unsigned long)took,
+                (unsigned long)fastest);
+}
+
+// B30 - the procedure, with the tractor's own arithmetic
+// (src/tractor/angle_factor.h): calibrate, weigh, correct the angle factor,
+// calibrate again. The run is always CALIBRATION_PULSES bursts and the factor
+// sets their angle, so what the run turns - and weighs - is in proportion to
+// the factor. With an auger that gives B_AUGER_GRAMS_PER_TURN, at 40 kg/ha and
+// the machine's 1571 mm a pulse, the first-boot factor weighs short; one
+// correction must bring the next run onto the expected mass, and halving the
+// dose - which halves the factor - must halve it.
+static constexpr double B_AUGER_GRAMS_PER_TURN = 15.0;
+
+// One whole calibration run at this factor and dose, 1571 mm a pulse: the
+// turns, and in `grams` what the scale reads - whole grams.
+static double bCalibrationRun(uint16_t factor, uint16_t dose, uint32_t &grams, bool &ok)
+{
+    BHarness h;
+    bFresh(h);
+    h.mmPerPulse               = 1571;
+    h.command.burstAngleFactor = factor;
+    h.command.doseKgPerHa      = dose;
+    ok = bStartCalibration(h) && bCalibrateToEnd(h, 120000) && h.bursts >= 1;
+    bRun(h, 1000);
+    double edges = (double)(h.edges - h.logic.calibrationStartEdges);
+    ok = ok && edges >= bCalibWantEdges(h) - 1.0 && edges <= bCalibWantEdges(h) + 20.0;
+    double turns = edges / (double)ENCODER_EDGES_PER_REV;
+    grams = (uint32_t)(turns * B_AUGER_GRAMS_PER_TURN + 0.5);
+    return turns;
+}
+
+static void testB30()
+{
+    const uint16_t mm = 1571;
+    bool okA, okB, okC;
+    uint32_t gramsA, gramsB, gramsC;
+
+    uint32_t expected = expectedCalibrationGrams(40, mm);                      // 503 g
+    uint16_t factorA  = DEFAULT_ANGLE_FACTOR;
+    double   turnsA   = bCalibrationRun(factorA, 40, gramsA, okA);
+    uint16_t factorB  = angleFactorFromWeighing(factorA, expected, gramsA);
+    double   turnsB   = bCalibrationRun(factorB, 40, gramsB, okB);
+
+    uint16_t factorC   = angleFactorForDose(factorB, 40, 20);
+    uint32_t expectedC = expectedCalibrationGrams(20, mm);                     // 251 g
+    bCalibrationRun(factorC, 20, gramsC, okC);
+
+    // The factor is whole numbers and the scale and the expected mass whole
+    // grams, so the corrected run is allowed half a unit of each it went
+    // through - 0.2 % or less apiece in a 20-pulse run of 500 g, several % in
+    // a run of a few pulses - and a little for each run's final braking.
+    double errB  = ((double)gramsB - (double)expected) / (double)expected;
+    double errC  = ((double)gramsC - (double)expectedC) / (double)expectedC;
+    double tolB  = 0.002 + 0.5 / (double)expected + 0.5 / (double)gramsA + 0.5 / (double)gramsB +
+                   0.5 / (double)factorB;
+    double tolC  = tolB + 0.5 / (double)expectedC + 0.5 / (double)gramsC + 0.5 / (double)factorC;
+    double ratio = turnsB / turnsA;
+    double want  = (double)factorB / (double)factorA;
+
+    // The ends of the range: capped at three digits, never 0, and left alone
+    // with nothing to go by; and the largest run the wire allows, worked out
+    // here the long way.
+    uint32_t largest = (uint32_t)((double)CALIBRATION_PULSES * WHEEL_MM_PER_PULSE_MAX * WORKING_WIDTH_CM * 999.0 /
+                                  1000000.0 + 0.5);
+    bool ends = angleFactorFromWeighing(500, 503, 141) == ANGLE_FACTOR_MAX
+             && angleFactorFromWeighing(5, 100, 100000) == 1
+             && angleFactorFromWeighing(500, 503, 0) == 500
+             && angleFactorFromWeighing(500, 0, 503) == 500
+             && angleFactorForDose(500, 0, 40) == 500
+             && angleFactorForDose(0, 40, 80) == 0
+             && angleFactorForDose(500, 40, 50) == 625
+             && expectedCalibrationGrams(999, WHEEL_MM_PER_PULSE_MAX) == largest;
+
+    // The turns follow the factor exactly, but for the one burst's braking at
+    // the end of each run - the same few edges whatever its length.
+    double tolRatio = 0.002 + 2.0 * 20.0 / (turnsA * (double)ENCODER_EDGES_PER_REV);
+
+    bool ok = okA && okB && okC && ends && gramsA < expected && gramsB > 0 && gramsC > 0
+           && fabs(errB) <= tolB && fabs(errC) <= tolC && fabs(ratio - want) <= tolRatio;
+
+    reportCheck("B30", ok, "%.0f g a turn, 40 kg/ha: factor %u weighs %lu g of %lu; corrected to %u, %lu g "
+                "(%+.1f %%); at 20 kg/ha factor %u, %lu g of %lu (%+.1f %%); ends of range %s",
+                B_AUGER_GRAMS_PER_TURN, (unsigned)factorA, (unsigned long)gramsA, (unsigned long)expected,
+                (unsigned)factorB, (unsigned long)gramsB, 100.0 * errB, (unsigned)factorC,
+                (unsigned long)gramsC, (unsigned long)expectedC, 100.0 * errC, ends ? "right" : "WRONG");
+}
+
 // ---------------------------------------------------------------------------
 
 static void runBurstTests()
@@ -1425,6 +1629,8 @@ static void runBurstTests()
     testB26();
     testB27();
     testB28();
+    testB29();
+    testB30();
 
     reportCheck("B19", b19Ok && b19Count > 0,
                 "dispenserFillStatus matched the step, with the averaged RPM, over %lu checks",

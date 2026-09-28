@@ -35,7 +35,10 @@ static constexpr uint8_t PROTOCOL_MAGIC_1 = 'S';
 //     on the metering drive, whose ratio to the ground wheel depends on the
 //     seed-size gear, so the distance per pulse is an operator setting - one
 //     measured value per gear - instead of a constant.
-static constexpr uint8_t PROTOCOL_VERSION = 5;
+// v6: TractorCommand carries burstAngleFactor, the burst-mode calibration: the
+//     angle each wheel pulse's burst turns is set on the tractor as a factor,
+//     not worked out from the grams-per-100-revolutions calibration.
+static constexpr uint8_t PROTOCOL_VERSION = 6;
 
 static const uint8_t BROADCAST_ADDRESS[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -128,8 +131,14 @@ struct __attribute__((packed)) TractorCommand {
                                  // selected. The seeder turns pulses into
                                  // speed with it, the dispenser turns them into
                                  // distance. Never sent as 0; see below.
+    uint16_t burstAngleFactor;   // burst metering's calibration, 0-999 from the
+                                 // tractor: the angle each pulse's burst turns,
+                                 // in thousandths of a reference angle
+                                 // (burstRevsPerPulse() in dispenser_logic.h).
+                                 // Unused in continuous metering, which goes by
+                                 // gramsPer100Rev and the dose.
 };
-static_assert(sizeof(TractorCommand) == 26, "TractorCommand layout changed - reflash ALL boards");
+static_assert(sizeof(TractorCommand) == 28, "TractorCommand layout changed - reflash ALL boards");
 
 // Both receivers clamp the wire value the same way: anything outside the limits
 // - including the 0 a board that does not set it yet would send - falls back to

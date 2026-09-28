@@ -463,8 +463,10 @@ static void bootReport()
                   (unsigned long)UNCLOG_TOTAL_MS, (unsigned)UNCLOG_PERMILLE,
                   (unsigned long)UNCLOG_REVERSE_MS, (unsigned long)UNCLOG_PAUSE_MS,
                   (unsigned long)UNCLOG_FORWARD_MS, (unsigned)UNCLOG_CYCLES);
-    Serial.printf("   calibration     %u revolutions at %u RPM, or at full duty in burst metering\n",
-                  (unsigned)CALIBRATION_REVOLUTIONS, (unsigned)CALIBRATION_RPM);
+    Serial.printf("   calibration     %u revolutions at %u RPM; in burst metering %u real bursts, spaced as "
+                  "at %u mm/s\n",
+                  (unsigned)CALIBRATION_REVOLUTIONS, (unsigned)CALIBRATION_RPM,
+                  (unsigned)CALIBRATION_PULSES, (unsigned)CALIBRATION_SPEED_MM_S);
     Serial.printf("   production      %s metering (DISPENSER_BURST_MODE)\n",
                   DISPENSER_BURST_MODE ? "BURST" : "continuous");
     Serial.printf("   burst           one per wheel pulse at %u permille (BURST_PWM_FRACTION %.2f), full PWM "
@@ -472,6 +474,10 @@ static void bootReport()
                   "after %u late pulses, backlog cap %u pulses\n",
                   (unsigned)BURST_PERMILLE, (double)BURST_PWM_FRACTION, (unsigned)BURST_CLOG_MIN_RPM,
                   (unsigned)BURST_LATE_PULSES, (unsigned)BURST_MAX_BACKLOG_PULSES);
+    Serial.printf("   angle factor    the tractor's, in thousandths of %u RPM at the burst PWM for one pulse at "
+                  "%u mm/s; the bench's simulated tractor sends %u\n",
+                  (unsigned)BURST_ANGLE_REFERENCE_RPM, (unsigned)BURST_ANGLE_REFERENCE_SPEED_MM_S,
+                  (unsigned)BENCH_ANGLE_FACTOR);
 
     Serial.printf(" ESP-NOW: %s\n", bootInfo.espnowOk ? "initialised" : "FAILED TO INITIALISE");
 }
@@ -480,8 +486,8 @@ static void printMenu()
 {
     Serial.println();
     Serial.println("--- menu ------------------------------------------------------------------");
-    Serial.println("  d  logic tests (D01-D35, the ledger L01-L12, burst metering B01-B28, no hardware)");
-    Serial.println("  w  ground speed from wheel pulses (W01-W11, no hardware)");
+    Serial.println("  d  logic tests (D01-D35, the ledger L01-L12, burst metering B01-B30, no hardware)");
+    Serial.println("  w  ground speed from wheel pulses (W01-W12, no hardware)");
     Serial.println("  v  packet tests (V01-V08, no motor)");
     Serial.println("  h  hardware (H00-H07, motor: read the checklist first)");
     Serial.println("  m  metering and links, continuous metering (M01-M11, motor)");

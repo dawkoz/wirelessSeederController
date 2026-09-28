@@ -11,6 +11,7 @@
 
 #include "machine_settings.h"
 #include "espnow_protocol.h"
+#include "angle_factor.h"
 
 // ===========================================================================
 // TEMPORARY - button debugging on serial, at SERIAL_BAUD. 1 = on, 0 = off:
@@ -38,6 +39,7 @@ static Adafruit_SH1106 oled((int8_t)OLED_RESET);
 
 static constexpr uint16_t MAX_DOSE_KG_PER_HA   = 999;     // 3 digits
 static constexpr uint32_t MAX_GRAMS_PER_100REV = 99999;   // 5 digits
+static constexpr uint32_t MAX_CALIB_MASS_GRAMS = 99999;   // 5 digits: any run fits, at most 39960 g expected
 
 static constexpr uint32_t DISPLAY_INTERVAL_MS = 200;
 
@@ -49,7 +51,9 @@ enum class Screen : uint8_t {
     Menu,
     Work,
     EditDose,
-    EditCalibration,
+    EditCalibration,  // grams per 100 turns - continuous metering's Kalibracja
+    EditAngle,        // the angle factor - burst metering's Kalibracja, screen 5
+    CalibMass,        // what the burst calibration run weighed -> the factor, screen 5b
     CalibConfirm,     // "Start kalibracji?" -> Anuluj / START
     CalibRunning,     // progress bar while the dispenser turns
     Tramlines,        // the tramline on/off switch, screen 15
@@ -72,6 +76,8 @@ enum class View : uint8_t {
     WorkFault,        // a fault replaces the work screen entirely
     EditDose,
     EditCalibration,
+    EditAngle,
+    CalibMass,
     Tramlines,
     CalibConfirm,
     CalibProgress,
@@ -123,11 +129,15 @@ static uint8_t  menuIndex = 0;
 static uint8_t  menuTop   = 0;   // first of the four menu rows on screen
 
 // Numeric editor. digits[] holds one decimal digit each, most significant
-// first. The cursor runs across the digits and then onto two trailing action
+// first. The cursor runs across the digits and then onto the trailing action
 // fields, so the positions are:
 //     0 .. digitCount-1   the digits
-//     digitCount          the screen's extra action (WL./WYL. or TEST)
+//     digitCount          the screen's extra action (WL./WYL., TEST or WROC)
 //     digitCount+1        ZAPISZ
+// except on the angle factor's screen, which has one action more:
+//     digitCount          TEST
+//     digitCount+1        MASA
+//     digitCount+2        ZAPISZ
 // editingDigit means short presses change the digit rather than move on.
 static uint8_t digits[5]    = {0};
 static uint8_t digitCount   = 0;
@@ -140,6 +150,14 @@ static bool     calibrationRequested = false;
 static uint16_t doseKgPerHa      = DEFAULT_DOSE_KG_PER_HA;
 static uint32_t gramsPer100Rev   = DEFAULT_GRAMS_PER_100REV;
 static bool     dispenserEnabled = false;
+
+// Burst metering's calibration (DISPENSER_BURST_MODE), 0-999: the angle each
+// wheel pulse's burst turns, in thousandths of what the motor turns flat out
+// between two pulses at 10 km/h (see angle_factor.h). Set by weighing the
+// calibration run or by hand on screen 5, and scaled with the dose whenever a
+// new one is saved. Stored in NVS; sent in every command in both kinds of
+// metering, though only burst metering reads it.
+static uint16_t angleFactor      = DEFAULT_ANGLE_FACTOR;
 
 static uint8_t tramlineNumber = 0;
 
@@ -317,6 +335,7 @@ static void sendCommand(uint32_t now)
     command.clogClearSeq     = clogClearSeq;
     command.unclogSeq        = unclogSeq;
     command.wheelMmPerPulse  = activeWheelMmPerPulse();
+    command.burstAngleFactor = angleFactor;
 
     broadcast(&command, sizeof(command), now);
 }
@@ -380,8 +399,8 @@ static void debugButton(ButtonDebugKind kind, uint8_t outcome, uint32_t ms, uint
 }
 
 static const char *const VIEW_DEBUG_NAMES[] = {
-    "Menu", "Work", "WorkFault", "EditDose", "EditCalibration", "Tramlines", "CalibConfirm",
-    "CalibProgress", "CalibDone", "CalibRefused", "CalibNoDispenser", "CalibInterrupted",
+    "Menu", "Work", "WorkFault", "EditDose", "EditCalibration", "EditAngle", "CalibMass", "Tramlines",
+    "CalibConfirm", "CalibProgress", "CalibDone", "CalibRefused", "CalibNoDispenser", "CalibInterrupted",
     "ClogAlert", "ClogChoice", "Unclogging", "Seeds", "SeedCalibAsk", "SeedCalibRun",
     "SeedCalibResult", "Settings", "Blower",
 };
@@ -666,20 +685,77 @@ static uint32_t digitsToValue()
     return value;
 }
 
+// What the burst calibration run should weigh at the dose and seed size in use -
+// so it follows both by itself.
+static uint32_t calibExpectedGrams()
+{
+    return expectedCalibrationGrams(doseKgPerHa, activeWheelMmPerPulse());
+}
+
+static void storeAngleFactor(uint16_t factor)
+{
+    if (factor > ANGLE_FACTOR_MAX) factor = ANGLE_FACTOR_MAX;
+    angleFactor = factor;
+    prefs.putUShort("angle", angleFactor);
+}
+
 static void saveEditedValue()
 {
     uint32_t value = digitsToValue();
 
-    if (screen == Screen::EditDose) {
-        if (value > MAX_DOSE_KG_PER_HA) value = MAX_DOSE_KG_PER_HA;
-        doseKgPerHa = (uint16_t)value;
-        prefs.putUShort("dose", doseKgPerHa);
-        prefs.putBool("disp_on", dispenserEnabled);
-    } else {
-        if (value > MAX_GRAMS_PER_100REV) value = MAX_GRAMS_PER_100REV;
-        gramsPer100Rev = value;
-        prefs.putULong("calib", gramsPer100Rev);
+    switch (screen) {
+        case Screen::EditDose: {
+            if (value > MAX_DOSE_KG_PER_HA) value = MAX_DOSE_KG_PER_HA;
+            // The burst angle a pulse needs is in proportion to the dose, so the
+            // angle factor follows it: a new dose needs no new calibration run to
+            // be about right - though grams per turn need not be quite constant,
+            // so after a large change one is worth doing.
+            uint16_t factor = angleFactorForDose(angleFactor, doseKgPerHa, (uint16_t)value);
+            doseKgPerHa = (uint16_t)value;
+            prefs.putUShort("dose", doseKgPerHa);
+            prefs.putBool("disp_on", dispenserEnabled);
+            if (factor != angleFactor) storeAngleFactor(factor);
+            break;
+        }
+        case Screen::EditAngle:
+            storeAngleFactor((uint16_t)value);
+            break;
+        case Screen::CalibMass:
+            // The weighed mass: the factor that would have made it the expected
+            // one. A mass of 0 leaves the factor as it was.
+            storeAngleFactor(angleFactorFromWeighing(angleFactor, calibExpectedGrams(), value));
+            break;
+        default:
+            if (value > MAX_GRAMS_PER_100REV) value = MAX_GRAMS_PER_100REV;
+            gramsPer100Rev = value;
+            prefs.putULong("calib", gramsPer100Rev);
+            break;
     }
+}
+
+// Screen 5 in burst metering: the angle factor, with the cursor on the first
+// digit, or on TEST when coming back to it for another run.
+static void openAngleEditor(bool onTest)
+{
+    screen = Screen::EditAngle;
+    loadDigits(angleFactor, 3);
+    if (onTest) cursor = digitCount;
+}
+
+// Screen 5b: the weighed mass, starting from what the run should weigh. Left
+// as it is, ZAPISZ then changes nothing.
+static void openMassEditor()
+{
+    uint32_t expected = calibExpectedGrams();
+    if (expected > MAX_CALIB_MASS_GRAMS) expected = MAX_CALIB_MASS_GRAMS;
+    screen = Screen::CalibMass;
+    loadDigits(expected, 5);
+}
+
+// Where the calibration run's screens return to: the editor TEST was on.
+static Screen calibEditorScreen()
+{
+    return DISPENSER_BURST_MODE ? Screen::EditAngle : Screen::EditCalibration;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,8 +780,12 @@ static void handleMenu(ButtonEvent event)
                 loadDigits(doseKgPerHa, 3);
                 break;
             case MenuItem::Kalibracja:
-                screen = Screen::EditCalibration;
-                loadDigits(gramsPer100Rev, 5);
+                if (DISPENSER_BURST_MODE) {
+                    openAngleEditor(false);
+                } else {
+                    screen = Screen::EditCalibration;
+                    loadDigits(gramsPer100Rev, 5);
+                }
                 break;
             case MenuItem::Sciezki:
                 screen = Screen::Tramlines;
@@ -910,6 +990,8 @@ static void exportSettings()
     Serial.printf("  uptime              %lu s\n",          (unsigned long)(millis() / 1000));
     Serial.printf("  dose                %u kg/ha\n",       (unsigned)doseKgPerHa);
     Serial.printf("  dispenser calib     %lu g per 100 rev\n", (unsigned long)gramsPer100Rev);
+    Serial.printf("  angle factor        %u (burst metering %s)\n", (unsigned)angleFactor,
+                  DISPENSER_BURST_MODE ? "ON" : "OFF");
     Serial.printf("  dispenser           %s\n",             dispenserEnabled ? "ON" : "OFF");
     Serial.printf("  tramlines           %s\n",             tramlinesEnabled ? "ON" : "OFF");
     Serial.printf("  seed size           %s\n",             seedLarge ? "LARGE" : "SMALL");
@@ -923,6 +1005,7 @@ static void exportSettings()
     Serial.printf("  static constexpr bool     DEFAULT_SEED_LARGE        = %s;\n",  seedLarge ? "true" : "false");
     Serial.printf("  static constexpr uint16_t DEFAULT_WHEEL_MM_SMALL    = %u;\n",  (unsigned)wheelMmSmall);
     Serial.printf("  static constexpr uint16_t DEFAULT_WHEEL_MM_LARGE    = %u;\n",  (unsigned)wheelMmLarge);
+    Serial.printf("  static constexpr uint16_t DEFAULT_ANGLE_FACTOR      = %u;\n",  (unsigned)angleFactor);
     Serial.println("=== END, keep this with the date in docs/calibration-settings.txt ===");
 }
 
@@ -943,16 +1026,24 @@ static void handleSettings(ButtonEvent event)
     }
 }
 
+// The editors' action fields after the digits: the screen's own action and
+// ZAPISZ, or TEST, MASA and ZAPISZ on the angle factor's.
+static uint8_t editActionCount()
+{
+    return (screen == Screen::EditAngle) ? 3 : 2;
+}
+
 static void handleEdit(ButtonEvent event)
 {
-    const uint8_t extraField = digitCount;        // WL./WYL. or TEST
-    const uint8_t saveField  = digitCount + 1;    // ZAPISZ
+    const uint8_t fields     = digitCount + editActionCount();
+    const uint8_t extraField = digitCount;        // WL./WYL., TEST or WROC
+    const uint8_t saveField  = fields - 1;        // ZAPISZ, always the last
 
     if (event == ButtonEvent::Short) {
         if (editingDigit) {
             digits[cursor] = (digits[cursor] + 1) % 10;
         } else {
-            cursor = (cursor + 1) % (digitCount + 2);   // wraps through both actions
+            cursor = (cursor + 1) % fields;       // wraps through the actions
         }
         return;
     }
@@ -963,14 +1054,32 @@ static void handleEdit(ButtonEvent event)
         editingDigit = false;                     // commit this digit
     } else if (cursor == saveField) {
         saveEditedValue();
-        screen = Screen::Menu;
+        // The mass is only a way to the factor, so it goes back to it, ready
+        // for the next run.
+        if (screen == Screen::CalibMass) openAngleEditor(true);
+        else                             screen = Screen::Menu;
     } else if (cursor == extraField) {
-        if (screen == Screen::EditDose) {
-            dispenserEnabled = !dispenserEnabled;
-        } else {
-            calibConfirmIndex = 0;                // default to Anuluj
-            screen = Screen::CalibConfirm;
+        switch (screen) {
+            case Screen::EditDose:
+                dispenserEnabled = !dispenserEnabled;
+                break;
+            case Screen::CalibMass:
+                openAngleEditor(true);            // WROC: back, the factor untouched
+                break;
+            default:
+                // TEST. A burst run goes by the angle factor, so the one on
+                // screen is stored first: the run tests what the operator sees.
+                // The continuous run is 100 turns whatever the calibration.
+                if (screen == Screen::EditAngle) saveEditedValue();
+                calibConfirmIndex = 0;            // default to Anuluj
+                screen = Screen::CalibConfirm;
+                break;
         }
+    } else if (cursor > extraField) {
+        // MASA, on the angle factor's screen only. Stores the factor on screen
+        // first, for the same reason as TEST: the mass corrects that one.
+        saveEditedValue();
+        openMassEditor();
     } else {
         editingDigit = true;
     }
@@ -988,7 +1097,7 @@ static void handleCalibConfirm(ButtonEvent event)
             calibStartWatchMs       = 0;
             screen = Screen::CalibRunning;
         } else {
-            screen = Screen::EditCalibration;
+            screen = calibEditorScreen();       // cursor is still on TEST
         }
     }
 }
@@ -1002,7 +1111,7 @@ static void cancelCalibration()
     calibrationInterrupted = false;
     calibStartWatchRunning = false;
     calibStartWatchMs      = 0;
-    screen = Screen::EditCalibration;   // cursor is still on TEST
+    screen = calibEditorScreen();       // cursor is still on TEST
 }
 
 // While the shaft is turning only a long press cancels, so a stray short
@@ -1016,6 +1125,15 @@ static void handleCalibTurning(ButtonEvent event)
 static void handleCalibResult(ButtonEvent event)
 {
     if (event != ButtonEvent::None) cancelCalibration();
+}
+
+// Finished. In burst metering the press goes straight on to entering what the
+// run weighed.
+static void handleCalibDone(ButtonEvent event)
+{
+    if (event == ButtonEvent::None) return;
+    cancelCalibration();
+    if (DISPENSER_BURST_MODE) openMassEditor();
 }
 
 static void handleWorkFault(ButtonEvent event)
@@ -1062,7 +1180,9 @@ static void handleView(View view, ButtonEvent event)
         case View::Work:              handleWork(event);          break;
         case View::WorkFault:         handleWorkFault(event);     break;
         case View::EditDose:
-        case View::EditCalibration:   handleEdit(event);          break;
+        case View::EditCalibration:
+        case View::EditAngle:
+        case View::CalibMass:         handleEdit(event);          break;
         case View::Tramlines:         handleTramlines(event);     break;
         case View::Blower:            handleBlower(event);        break;
         case View::Seeds:             handleSeeds(event);         break;
@@ -1073,7 +1193,7 @@ static void handleView(View view, ButtonEvent event)
         case View::CalibConfirm:      handleCalibConfirm(event);  break;
         case View::CalibProgress:
         case View::CalibNoDispenser:  handleCalibTurning(event);  break;
-        case View::CalibDone:
+        case View::CalibDone:         handleCalibDone(event);     break;
         case View::CalibRefused:
         case View::CalibInterrupted:  handleCalibResult(event);   break;
         case View::ClogAlert:         handleClogAlert(event);     break;
@@ -1186,7 +1306,7 @@ static void updateScreenBookkeeping(uint32_t now)
         calibrationInterrupted = false;
         calibStartWatchRunning = false;
         calibStartWatchMs      = 0;
-        screen = Screen::EditCalibration;   // cursor is still on TEST
+        screen = calibEditorScreen();       // cursor is still on TEST
     }
 
     // After START the dispenser must be Calibrating. If it reports Normal
@@ -1229,6 +1349,8 @@ static View currentView()
         case Screen::Work:            return faultTakesOverScreen() ? View::WorkFault : View::Work;
         case Screen::EditDose:        return View::EditDose;
         case Screen::EditCalibration: return View::EditCalibration;
+        case Screen::EditAngle:       return View::EditAngle;
+        case Screen::CalibMass:       return View::CalibMass;
         case Screen::Tramlines:       return View::Tramlines;
         case Screen::Seeds:           return View::Seeds;
         case Screen::SeedCalibAsk:    return View::SeedCalibAsk;
@@ -1439,12 +1561,18 @@ static void drawSettings()
     oled.setTextSize(1);
 
     // Worst case each of these lines is exactly 21 characters, which is the
-    // full width at text size 1.
+    // full width at text size 1. The calibration shown is the one the metering
+    // in use goes by: the angle factor in burst metering.
     oled.setCursor(0, 0);
     oled.print("Dawka:");
     oled.print(doseKgPerHa);
-    oled.print(" Kalib:");
-    oled.print(gramsPer100Rev);
+    if (DISPENSER_BURST_MODE) {
+        oled.print(" Kat:");
+        oled.print(angleFactor);
+    } else {
+        oled.print(" Kalib:");
+        oled.print(gramsPer100Rev);
+    }
 
     oled.setCursor(0, 10);
     oled.print("Doz:");
@@ -1614,17 +1742,63 @@ static void drawWork()
     }
 }
 
+// One action field on an editor's bottom row, label at textX.
+static void drawEditField(int16_t x, int16_t width, int16_t textX, const char *label, bool selected)
+{
+    if (selected) {
+        oled.fillRect(x, 50, width, 12, WHITE);
+        oled.setTextColor(BLACK);
+    } else {
+        oled.setTextColor(WHITE);
+    }
+    oled.setCursor(textX, 52);
+    oled.print(label);
+}
+
+// The line under the digits of the two burst calibration screens, at text size
+// 1: what the run should weigh - 20 pulses' worth of ground at the dose and
+// seed size in use - and, on the mass screen, the angle factor now and what
+// ZAPISZ would make it. The two halves there are drawn apart, so the widest
+// numbers (a 5-digit mass) still leave a gap: "Ocz.39960g" ends at x = 59 and
+// "Kat 999>999" starts at x = 62.
+static void drawCalibInfo(int16_t y)
+{
+    uint32_t expected = calibExpectedGrams();
+    char     text[24];
+
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(0, y);
+
+    if (screen == Screen::EditAngle) {
+        snprintf(text, sizeof(text), "%u porcji = %lu g", (unsigned)CALIBRATION_PULSES, (unsigned long)expected);
+        oled.print(text);
+        return;
+    }
+
+    snprintf(text, sizeof(text), "Ocz.%lug", (unsigned long)expected);
+    oled.print(text);
+
+    uint16_t after = angleFactorFromWeighing(angleFactor, expected, digitsToValue());
+    snprintf(text, sizeof(text), "Kat %u>%u", (unsigned)angleFactor, (unsigned)after);
+    oled.setCursor(SCREEN_WIDTH - 6 * (int16_t)strlen(text), y);
+    oled.print(text);
+}
+
 static void drawEdit()
 {
     oled.setTextColor(WHITE);
     oled.setTextSize(1);
     oled.setCursor(0, 0);
-    if (screen == Screen::EditDose) {
-        oled.print("DAWKA kg/ha");
-    } else {
-        // Kept short on purpose: the built-in font is 6 px per character, so
-        // a longer title runs into the mode label drawn at x = 92.
-        oled.print("KALIBR. g/100");
+    switch (screen) {
+        case Screen::EditDose:  oled.print("DAWKA kg/ha"); break;
+        case Screen::EditAngle: oled.print("WSP. KATA");   break;
+        case Screen::CalibMass: oled.print("MASA g");      break;
+        default:
+            // Kept short on purpose: the built-in font is 6 px per character, so
+            // a longer title runs into the mode label drawn at x = 92.
+            oled.print("KALIBR. g/100");
+            break;
     }
 
     // Textual mode indicator: which of the two press meanings is currently
@@ -1632,6 +1806,10 @@ static void drawEdit()
     oled.setCursor(92, 0);
     oled.print(editingDigit ? "ZMIEN" : "WYBOR");
 
+    // The burst calibration screens have a line of their own under the digits
+    // (drawCalibInfo), so their digits sit 3 px higher to make room for it.
+    bool          infoLine  = (screen == Screen::EditAngle || screen == Screen::CalibMass);
+    const int16_t top       = infoLine ? 11 : 14;   // of the highlight; the digit is 3 px lower
     const int16_t charWidth = 18;   // text size 3
     int16_t totalWidth = digitCount * charWidth;
     int16_t x0 = (SCREEN_WIDTH - totalWidth) / 2;
@@ -1641,44 +1819,35 @@ static void drawEdit()
         int16_t x = x0 + i * charWidth;
         bool selected = (cursor == i);
         if (selected) {
-            oled.fillRect(x - 1, 14, charWidth, 28, WHITE);
+            oled.fillRect(x - 1, top, charWidth, 28, WHITE);
             oled.setTextColor(BLACK);
         } else {
             oled.setTextColor(WHITE);
         }
-        oled.setCursor(x, 17);
+        oled.setCursor(x, top + 3);
         oled.print(digits[i]);
     }
 
-    // The two action fields sit side by side on the bottom row.
     oled.setTextSize(1);
+    if (infoLine) drawCalibInfo(40);
+
+    // The action fields sit side by side on the bottom row: three on the angle
+    // factor's screen, two everywhere else.
+    if (screen == Screen::EditAngle) {
+        drawEditField(0,  40, 8,  "TEST",   cursor == digitCount);
+        drawEditField(43, 40, 51, "MASA",   cursor == digitCount + 1);
+        drawEditField(86, 42, 89, "ZAPISZ", cursor == digitCount + 2);
+        return;
+    }
 
     const char *extraLabel;
-    if (screen == Screen::EditDose) {
-        extraLabel = dispenserEnabled ? "WL." : "WYL.";
-    } else {
-        extraLabel = "TEST";
+    switch (screen) {
+        case Screen::EditDose:  extraLabel = dispenserEnabled ? "WL." : "WYL."; break;
+        case Screen::CalibMass: extraLabel = "WROC";                            break;
+        default:                extraLabel = "TEST";                            break;
     }
-
-    bool extraSelected = (cursor == digitCount);
-    if (extraSelected) {
-        oled.fillRect(2, 50, 52, 12, WHITE);
-        oled.setTextColor(BLACK);
-    } else {
-        oled.setTextColor(WHITE);
-    }
-    oled.setCursor(6, 52);
-    oled.print(extraLabel);
-
-    bool saveSelected = (cursor == digitCount + 1);
-    if (saveSelected) {
-        oled.fillRect(62, 50, 62, 12, WHITE);
-        oled.setTextColor(BLACK);
-    } else {
-        oled.setTextColor(WHITE);
-    }
-    oled.setCursor(70, 52);
-    oled.print("ZAPISZ");
+    drawEditField(2,  52, 6,  extraLabel, cursor == digitCount);
+    drawEditField(62, 62, 70, "ZAPISZ",   cursor == digitCount + 1);
 }
 
 // Screens 15 and 21: a title, the switch (cursor 0) and ZAPISZ (cursor 1). The
@@ -1746,8 +1915,16 @@ static void drawCalibConfirm()
     oled.setCursor(0, 4);
     oled.print("Start kalibracji?");
     oled.setCursor(0, 16);
-    oled.print(CALIBRATION_REVOLUTIONS);
-    oled.print(" obrotow");
+    if (DISPENSER_BURST_MODE) {
+        // What the run is and what it should weigh.
+        oled.print(CALIBRATION_PULSES);
+        oled.print(" porcji = ");
+        oled.print(calibExpectedGrams());
+        oled.print(" g");
+    } else {
+        oled.print(CALIBRATION_REVOLUTIONS);
+        oled.print(" obrotow");
+    }
 
     // The 20 px grid of drawSelectableLine(). At y = 50 the highlight bar and
     // the bottom two pixel rows of the glyphs would fall off the 64 px panel.
@@ -1782,7 +1959,15 @@ static void drawProgress(const char *title, uint8_t percent)
 
 static void drawCalibProgress()
 {
-    drawProgress("Kalibracja...", dispenserData.progressPercent);
+    if (DISPENSER_BURST_MODE) {
+        // The mass the bursts should add up to stays in sight while they run.
+        // At most 21 characters, the full width: "Kalibracja... 39960 g".
+        char title[24];
+        snprintf(title, sizeof(title), "Kalibracja... %lu g", (unsigned long)calibExpectedGrams());
+        drawProgress(title, dispenserData.progressPercent);
+    } else {
+        drawProgress("Kalibracja...", dispenserData.progressPercent);
+    }
 }
 
 static void drawCalibNoDispenser()
@@ -1818,6 +2003,18 @@ static void drawCalibDone()
     oled.setCursor(0, 6);
     oled.print("GOTOWE");
     oled.setTextSize(1);
+    if (DISPENSER_BURST_MODE) {
+        // Any press opens the mass screen (5b).
+        oled.setCursor(0, 30);
+        oled.print("Ocz. masa: ");
+        oled.print(calibExpectedGrams());
+        oled.print(" g");
+        oled.setCursor(0, 42);
+        oled.print("Zwaz nawoz.");
+        oled.setCursor(0, 54);
+        oled.print("Nacisnij: wpisz mase");
+        return;
+    }
     oled.setCursor(0, 30);
     oled.print("Zwaz nawoz i wpisz");
     oled.setCursor(0, 42);
@@ -1877,7 +2074,9 @@ static void redraw()
         case View::Work:              drawWork();             break;
         case View::WorkFault:         drawFaultScreen();      break;
         case View::EditDose:
-        case View::EditCalibration:   drawEdit();             break;
+        case View::EditCalibration:
+        case View::EditAngle:
+        case View::CalibMass:         drawEdit();             break;
         case View::Tramlines:         drawTramlines();        break;
         case View::Blower:            drawBlower();           break;
         case View::Seeds:             drawSeeds();            break;
@@ -1948,6 +2147,10 @@ void setup()
     wheelMmSmall     = prefs.getUShort("wheel_s", DEFAULT_WHEEL_MM_SMALL);
     wheelMmLarge     = prefs.getUShort("wheel_l", DEFAULT_WHEEL_MM_LARGE);
     seedLarge        = prefs.getBool("seed_l",    DEFAULT_SEED_LARGE);
+    angleFactor      = prefs.getUShort("angle",   DEFAULT_ANGLE_FACTOR);
+    // Three digits on screen 5, which would show and store only the last three
+    // of anything larger.
+    if (angleFactor > ANGLE_FACTOR_MAX) angleFactor = ANGLE_FACTOR_MAX;
 
     oled.begin(SH1106_SWITCHCAPVCC, OLED_I2C_ADDRESS);
     // oled.begin() calls Wire.begin(), which leaves the bus at the Arduino
