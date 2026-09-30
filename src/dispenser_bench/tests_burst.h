@@ -79,6 +79,8 @@ struct BHarness {
     uint32_t motorSteps   = 0;    // steps that left the motor driven
     uint32_t bursts       = 0;    // times the motor went from off to on
     bool     motorWasOn   = false;
+    uint32_t pushes       = 0;    // times the motor went from off to backwards
+    bool     pushWasOn    = false;
     uint32_t onMs         = 0;    // time with the motor driven...
     uint32_t onEdges      = 0;    // ...and the edges turned in it: the burst speed
     bool     oddDuty      = false; // a duty other than 0 and the burst PWM
@@ -86,6 +88,9 @@ struct BHarness {
     bool     sawClogged   = false;
     bool     sawOverSpeed = false;
     bool     sawNoSpeed   = false;
+    bool     sawAutoUnclog = false;
+    uint32_t failures     = 0;    // failed bursts (BURST_FAIL_MS)...
+    uint8_t  lastFailures = 0;    // ...counted from the logic's wrapping counter
     double   worstOvershootEdges = 0.0;   // turned past what was owed, seen with the motor off
     double   worstOwedRev = 0.0;          // the most the ledger ever owed
     double   leastOwedRev = 0.0;          // the most it was ever ahead (negative)
@@ -116,6 +121,7 @@ static void bFresh(BHarness &h)
     h.command.doseKgPerHa      = 40;
     h.command.gramsPer100Rev   = 500;
     h.command.calibrationRun   = 0;
+    h.command.simulationRun    = 0;
     h.command.wheelMmPerPulse  = h.mmPerPulse;
     h.command.burstAngleFactor = BENCH_ANGLE_FACTOR;
     h.nextSendMs = h.nowMs;
@@ -127,6 +133,7 @@ static void bWatch(BHarness &h)
     h.steps = 0;
     h.motorSteps = 0;
     h.bursts = 0;
+    h.pushes = 0;
     h.onMs = 0;
     h.onEdges = 0;
     h.oddDuty = false;
@@ -134,6 +141,9 @@ static void bWatch(BHarness &h)
     h.sawClogged = false;
     h.sawOverSpeed = false;
     h.sawNoSpeed = false;
+    h.sawAutoUnclog = false;
+    h.failures = 0;
+    h.lastFailures = h.logic.burstFailures;
     h.worstOvershootEdges = 0.0;
     h.worstOwedRev = 0.0;
     h.leastOwedRev = 0.0;
@@ -169,12 +179,16 @@ static bool bAddsUp(double got, double want)
 static void bStep(BHarness &h)
 {
     h.steps++;
-    if (h.out.motorPermille > 0) h.motorSteps++;
-    if (h.out.motorPermille != 0 && h.out.motorPermille != h.logic.burstPermille) h.oddDuty = true;
+    if (h.out.motorPermille > 0 && h.out.motorForward) h.motorSteps++;
+    bool push = !h.out.motorForward && h.out.motorPermille == BURST_BACKLASH_PERMILLE;   // after a burst
+    if (h.out.motorPermille != 0 && h.out.motorPermille != h.logic.burstPermille && !push) h.oddDuty = true;
     if (h.out.motorPermille > 0 && h.out.motorPermille < MOTOR_MIN_RUNNING_PERMILLE) h.lowDuty = true;
     if (h.logic.mode == DispenserMode::Clogged) h.sawClogged = true;
+    if (h.logic.mode == DispenserMode::AutoUnclogging) h.sawAutoUnclog = true;
     if (h.logic.fault == DispenserFault::OverSpeed)   h.sawOverSpeed = true;
     if (h.logic.fault == DispenserFault::NoSpeedData) h.sawNoSpeed = true;
+    h.failures     += (uint8_t)(h.logic.burstFailures - h.lastFailures);
+    h.lastFailures  = h.logic.burstFailures;
 
     if (h.logic.mode == DispenserMode::Normal && h.logic.ledgerValid) {
         double owed = (double)h.logic.owedRevolutions;
@@ -194,6 +208,9 @@ static void bStep(BHarness &h)
     if (status.motorRunning != ((h.out.motorPermille > 0) ? 1 : 0)) b19Ok = false;
     if (status.targetShaftRPM != h.logic.targetRPM) b19Ok = false;
     if (status.progressPercent != h.logic.progress) b19Ok = false;
+    if (status.burstFailures != h.logic.burstFailures) b19Ok = false;
+    if (status.simBursts != h.logic.simBursts || status.simFailures != h.logic.simFailures) b19Ok = false;
+    if (status.simUnclogs != h.logic.simUnclogs) b19Ok = false;
     uint16_t rpm = h.logic.burstMode ? (uint16_t)(h.logic.averageRPM + 0.5f) : h.logic.measuredRPM;
     if (status.measuredShaftRPM != rpm) b19Ok = false;
 }
@@ -226,7 +243,7 @@ static void bTick(BHarness &h)
 
     // The shaft.
     double steady = 0.0;
-    if (h.out.motorPermille > 0) {
+    if (h.out.motorPermille > 0) {             // either way: the encoder counts up both ways
         steady = h.runRPM * (double)h.out.motorPermille / 1000.0 - h.droopRPM;
         if (steady < 0.0) steady = 0.0;
     }
@@ -243,14 +260,17 @@ static void bTick(BHarness &h)
     uint32_t whole = (uint32_t)h.edgeCarry;
     h.edgeCarry -= (double)whole;
     h.edges += whole;
-    if (h.out.motorPermille > 0) {
+    if (h.out.motorPermille > 0 && h.out.motorForward) {
         h.onMs++;
         h.onEdges += whole;
     }
 
-    // dispenserControlTick(): the burst's own stop on every call, then a step
-    // when one is due.
-    if (h.fastStop) dispenserBurstStop(h.logic, h.edges, h.out);
+    // dispenserControlTick(): the burst's own stop and the push backwards after
+    // it on every call, then a step when one is due.
+    if (h.fastStop) {
+        dispenserBurstStop(h.logic, h.nowMs, h.edges, h.out);
+        dispenserBacklashTick(h.logic, h.nowMs, h.out);
+    }
 
     h.command.upTimeMs         = h.nowMs;
     h.command.wheelMmPerPulse  = h.mmPerPulse;
@@ -267,9 +287,12 @@ static void bTick(BHarness &h)
 
     if (dispenserStep(h.logic, in, h.out)) bStep(h);
 
-    bool on = h.out.motorPermille > 0;
+    bool on     = h.out.motorPermille > 0 && h.out.motorForward;
+    bool pushOn = h.out.motorPermille > 0 && !h.out.motorForward;
     if (on && !h.motorWasOn) h.bursts++;
     h.motorWasOn = on;
+    if (pushOn && !h.pushWasOn) h.pushes++;
+    h.pushWasOn = pushOn;
 }
 
 static void bRun(BHarness &h, uint32_t ms)
@@ -301,13 +324,32 @@ static void bFinish(BHarness &h)
 }
 
 // Runs until the motor is off and has stopped - a moment between bursts.
+// Idle means nothing is about to move either: no push backwards still to come,
+// and nothing worth a burst owed - a pulse taken in during a push starts its
+// burst only once the push is over - unless a failed burst waits for a pulse.
 static bool bUntilIdle(BHarness &h, uint32_t limitMs)
 {
     for (uint32_t i = 0; i < limitMs; i++) {
         bTick(h);
-        if (h.out.motorPermille == 0 && h.shaftRPM == 0.0 && !h.logic.burstRunning) return true;
+        bool nothingOwed = h.logic.burstWaitPulse ||
+                           h.logic.owedRevolutions * (float)ENCODER_EDGES_PER_REV < (float)BURST_MIN_EDGES;
+        if (h.out.motorPermille == 0 && h.shaftRPM == 0.0 && !h.logic.burstRunning &&
+            h.logic.backlash == BacklashPush::None && nothingOwed) {
+            return true;
+        }
     }
     return false;
+}
+
+// The edges the model's shaft turns in one push backwards after a burst - the
+// real encoder counts them as well, whichever way the shaft turns - and so the
+// room the checks on counts give them, on top of a burst's braking.
+static double bPushEdges(const BHarness &h)
+{
+    if (BURST_BACKLASH_MS == 0 || BURST_BACKLASH_PERMILLE == 0) return 0.0;
+    double rpm = h.runRPM * (double)BURST_BACKLASH_PERMILLE / 1000.0 - h.droopRPM;
+    if (rpm < 0.0) rpm = 0.0;
+    return rpm * (double)ENCODER_EDGES_PER_REV / 60000.0 * (double)BURST_BACKLASH_MS + 2.0;
 }
 
 // Runs until a burst is under way with the shaft at full speed.
@@ -350,15 +392,17 @@ static void testB01()
 
     bool ok = reached && bAddsUp(got, want)
            && h.bursts == pulses
-           && !h.oddDuty && !h.sawClogged && !h.sawOverSpeed && !h.sawNoSpeed
+           && !h.oddDuty && !h.sawClogged && h.failures == 0 && !h.sawOverSpeed && !h.sawNoSpeed
            && idle > 0.2
-           && h.worstOvershootEdges <= 20.0
+           && h.worstOvershootEdges <= 20.0 + bPushEdges(h)
+           && h.pushes == ((BURST_BACKLASH_MS > 0 && BURST_BACKLASH_PERMILLE > 0) ? pulses : 0)
            && h.logic.mode == DispenserMode::Normal;
 
-    reportCheck("B01", ok, "%lu pulses: %.2f turns (want %.2f +-0.1), %lu bursts, motor off %.0f %% of "
-                "the steps, overshoot at most %.0f edges (limit 20), duty 0 or %u only",
-                (unsigned long)pulses, got, want, (unsigned long)h.bursts, 100.0 * idle,
-                h.worstOvershootEdges, (unsigned)B_FULL);
+    // The overshoot includes the push backwards after each burst.
+    reportCheck("B01", ok, "%lu pulses: %.2f turns (want %.2f +-0.1), %lu bursts and %lu pushes back, motor "
+                "off %.0f %% of the steps, overshoot at most %.0f edges (limit %.0f), duty 0 or %u only",
+                (unsigned long)pulses, got, want, (unsigned long)h.bursts, (unsigned long)h.pushes,
+                100.0 * idle, h.worstOvershootEdges, 20.0 + bPushEdges(h), (unsigned)B_FULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +428,7 @@ static void testB02()
 
     // One step at full speed, plus the brake.
     double limit = h.runRPM * (double)MOTOR_CONTROL_INTERVAL_MS / 60000.0 + 0.1;
-    bool ok = reached && fabs(got - want) <= limit && !h.sawClogged && !h.sawOverSpeed;
+    bool ok = reached && fabs(got - want) <= limit && !h.sawClogged && h.failures == 0 && !h.sawOverSpeed;
 
     reportCheck("B02", ok, "no stop between steps: %.2f turns (want %.2f +-%.2f), overshoot up to %.0f edges",
                 got, want, limit, h.worstOvershootEdges);
@@ -545,7 +589,7 @@ static void testB06()
     }
 
     bool ok = (tRaised != 0) && (tRaised - tFast <= 3000) && steady && capOk && fullOk
-           && (tCleared != 0) && (tCleared - tSlow <= 3000) && !h.sawClogged;
+           && (tCleared != 0) && (tCleared - tSlow <= 3000) && !h.sawClogged && h.failures == 0;
 
     reportCheck("B06", ok, "3000 mm/s: ZA SZYBKO after %lu ms (limit 3000) and steady %s, backlog at most "
                 "%.2f turns (cap %.2f), flat out %s; 500 mm/s: cleared after %lu ms (limit 3000)",
@@ -707,81 +751,70 @@ static void testB10()
 }
 
 // ---------------------------------------------------------------------------
-// B11 - a blocked auger in the middle of a burst: Clogged after CLOG_DETECT_MS
-// with the motor off, and it stays off with the machine still moving. Anuluj
-// goes back to dosing, without the pulses that went by while it was clogged;
-// Odetkaj still runs the unclog sequence.
+// B11 - a blocked auger in the middle of a burst, the machine moving on: the
+// burst fails after BURST_FAIL_MS - motor off in that step, no clog, no fault,
+// the failure counted for the tractor's LED - keeping at most one pulse's
+// worth owed, and nothing more is tried until the next pulse. Freed by then,
+// that pulse's burst makes up the failed one's portion with its own, and
+// reaching its count ends the run of failures.
 // ---------------------------------------------------------------------------
 
 static void testB11()
 {
+    if (BURST_FAILS_BEFORE_UNCLOG < 2) {
+        reportSkipped("B11", "BURST_FAILS_BEFORE_UNCLOG is 1: every failure unclogs at once (B31)");
+        return;
+    }
     BHarness h;
     bFresh(h);
     uint32_t e0, p0;
     bStart(h, e0, p0);
     bRunPulses(h, 5, 20000);
     bool inBurst = bUntilBurstAtSpeed(h, 5000);
+    bWatch(h);
 
     h.blocked = true;
     uint32_t t0 = h.nowMs;
-    bool clogged = false;
-    for (int i = 0; i < 3000; i++) {
-        bTick(h);
-        if (h.logic.mode == DispenserMode::Clogged) {
-            clogged = true;
-            break;
-        }
-    }
-    uint32_t tClog   = h.nowMs - t0;
-    bool     offOk   = (h.out.motorPermille == 0);
-    bool     timeOk  = clogged && tClog >= CLOG_DETECT_MS && tClog <= CLOG_DETECT_MS + 2 * MOTOR_CONTROL_INTERVAL_MS;
+    for (int i = 0; i < (int)BURST_FAIL_MS + 1000 && h.failures == 0; i++) bTick(h);
+    uint32_t tFail  = h.nowMs - t0;
+    bool     timeOk = h.failures == 1 && tFail >= BURST_FAIL_MS &&
+                      tFail <= BURST_FAIL_MS + 2 * MOTOR_CONTROL_INTERVAL_MS;
+    bool     quiet  = h.out.motorPermille == 0 && h.logic.mode == DispenserMode::Normal &&
+                      h.logic.fault == DispenserFault::None && h.logic.burstFailStreak == 1;
+    double   keptRev = (double)h.logic.owedRevolutions;
+    bool     kept    = keptRev > 0.0 && keptRev <= bRevsPerPulse(h) + 0.001;
 
-    bool stays = true;
-    for (int i = 0; i < 5000; i++) {          // the machine keeps moving
-        bTick(h);
-        if (h.logic.mode != DispenserMode::Clogged || h.out.motorPermille != 0) stays = false;
-    }
-
+    // Freed at once - the granule dropped - but only the next pulse tries again.
     h.blocked = false;
-    h.command.clogClearSeq = 1;               // Anuluj
-    bRun(h, MOTOR_CONTROL_INTERVAL_MS + 10);
-    bool normal  = (h.logic.mode == DispenserMode::Normal);
-    bRun(h, MOTOR_CONTROL_INTERVAL_MS + 10);  // the first step back only takes a snapshot
-    bool noDump  = (h.logic.owedRevolutions == 0.0f) && (h.out.motorPermille == 0);
-    uint32_t eBack = h.edges;
-    uint32_t pBack = h.logic.ledgerPulses;
-    bRunPulses(h, 5, 20000);
-    bUntilIdle(h, 5000);
-    double want = (double)(h.logic.ledgerPulses - pBack) * bRevsPerPulse(h);
-    double got  = bTurns(h, eBack);
-    bool   dosing = bAddsUp(got, want);
-
-    // And Odetkaj from a burst clog: the first step reverses, as in D10.
-    bUntilBurstAtSpeed(h, 5000);
-    h.blocked = true;
-    for (int i = 0; i < 3000 && h.logic.mode != DispenserMode::Clogged; i++) bTick(h);
-    h.command.unclogSeq = 1;
-    bool unclog = false;
-    for (int i = 0; i < 200; i++) {
+    uint32_t pFail = h.logic.ledgerPulses;
+    uint32_t eFail = h.edges;
+    bool     waits = true;
+    for (int i = 0; i < 5000 && h.logic.ledgerPulses == pFail; i++) {
         bTick(h);
-        if (h.logic.mode == DispenserMode::Unclogging) {
-            unclog = (h.out.motorPermille == UNCLOG_PERMILLE) && !h.out.motorForward;
-            break;
-        }
+        if (h.logic.ledgerPulses == pFail && h.out.motorPermille != 0 && h.out.motorForward) waits = false;
     }
+    bool retried = h.logic.ledgerPulses == pFail + 1 && h.out.motorPermille > 0;
 
-    bool ok = inBurst && timeOk && offOk && stays && normal && noDump && dosing && unclog;
+    // That burst: the kept portion and its own pulse's - and those of any pulse
+    // that comes while it makes them up - then the run is over.
+    bUntilIdle(h, 5000);
+    double want   = keptRev + (double)(h.logic.ledgerPulses - pFail) * bRevsPerPulse(h);
+    double got    = bTurns(h, eFail);
+    bool   madeUp = bAddsUp(got, want) && h.logic.burstFailStreak == 0;
 
-    reportCheck("B11", ok, "blocked mid-burst: Clogged after %lu ms (want %lu..%lu) with the motor off %s, "
-                "stays %s; Anuluj: dosing again with nothing dumped %s (%.2f of %.2f turns); Odetkaj "
-                "reverses %s",
-                (unsigned long)tClog, (unsigned long)CLOG_DETECT_MS,
-                (unsigned long)(CLOG_DETECT_MS + 2 * MOTOR_CONTROL_INTERVAL_MS), offOk ? "yes" : "NO",
-                stays ? "yes" : "NO", noDump ? "yes" : "NO", got, want, unclog ? "yes" : "NO");
+    bool ok = inBurst && timeOk && quiet && kept && waits && retried && madeUp &&
+              !h.sawClogged && !h.sawOverSpeed && !h.sawAutoUnclog;
+
+    reportCheck("B11", ok, "blocked mid-burst: failed after %lu ms (want %lu..%lu), quiet %s, %.2f turns kept; "
+                "waits for the next pulse %s; freed: %.2f turns (want %.2f), run over %s",
+                (unsigned long)tFail, (unsigned long)BURST_FAIL_MS,
+                (unsigned long)(BURST_FAIL_MS + 2 * MOTOR_CONTROL_INTERVAL_MS), quiet ? "yes" : "NO", keptRev,
+                waits ? "yes" : "NO", got, want, (h.logic.burstFailStreak == 0) ? "yes" : "NO");
 }
 
 // ---------------------------------------------------------------------------
-// B12 - a heavy auger that still turns is not a clog; one that barely does is
+// B12 - a heavy auger that still turns fails no burst; one that barely turns
+// fails them all, and is never called clogged
 // ---------------------------------------------------------------------------
 
 static void testB12()
@@ -796,24 +829,18 @@ static void testB12()
     bFinish(h);
     double want = (double)(h.logic.ledgerPulses - p0) * bRevsPerPulse(h);
     double got  = bTurns(h, e0);
-    bool heavyOk = !h.sawClogged && bAddsUp(got, want);
+    bool heavyOk = h.failures == 0 && !h.sawClogged && bAddsUp(got, want);
 
     BHarness g;
     bFresh(g);
     g.runRPM = (double)BURST_CLOG_MIN_RPM - 20.0;     // barely turning at full duty
-    bool clogged = false;
-    for (int i = 0; i < 10000; i++) {
-        bTick(g);
-        if (g.logic.mode == DispenserMode::Clogged) {
-            clogged = true;
-            break;
-        }
-    }
+    bRun(g, 10000);
+    bool failsOk = g.failures >= 1 && !g.sawClogged;
 
-    reportCheck("B12", heavyOk && clogged, "%u RPM at full duty for 60 s: never Clogged %s, %.2f of %.2f "
-                "turns; %u RPM: Clogged %s",
+    reportCheck("B12", heavyOk && failsOk, "%u RPM at full duty for 60 s: no burst failed %s, %.2f of %.2f "
+                "turns; %u RPM: %lu failed in 10 s, never Clogged %s",
                 (unsigned)(BURST_CLOG_MIN_RPM + 20), heavyOk ? "yes" : "NO", got, want,
-                (unsigned)(BURST_CLOG_MIN_RPM - 20), clogged ? "yes" : "NO");
+                (unsigned)(BURST_CLOG_MIN_RPM - 20), (unsigned long)g.failures, g.sawClogged ? "NO" : "yes");
 }
 
 // What the model's shaft settles at for a duty, load included.
@@ -904,7 +931,7 @@ static void testB13()
     uint32_t worstShare = 0, leastShare = 0xFFFFFFFFu;
     for (int i = 0; i < 120000; i++) {
         bTick(h);
-        bool on = h.out.motorPermille > 0;
+        bool on = h.out.motorPermille > 0 && h.out.motorForward;
         if (on && !wasOn) {
             uint32_t since = h.nowMs - h.logic.calibrationStartMs;
             uint32_t pulse = bursts * interval;
@@ -934,9 +961,12 @@ static void testB13()
 
     uint32_t turned  = h.edges - h.logic.calibrationStartEdges;
     double   want    = bCalibWantEdges(h);
-    bool     edgesOk = (double)turned >= want - 1.0 && (double)turned <= want + 20.0;
+    // Each burst's share holds its braking and its push backwards; each ends
+    // on the whole count so far, so the next one is that much shorter.
+    uint32_t pushRoom = (uint32_t)bPushEdges(h);
+    bool     edgesOk = (double)turned >= want - 1.0 && (double)turned <= want + 20.0 + (double)pushRoom;
     bool     sharesOk = (CALIBRATION_PULSES < 2) ||
-                        (leastShare + 20 >= pulseEdges && worstShare <= pulseEdges + 20);
+                        (leastShare + 20 + pushRoom >= pulseEdges && worstShare <= pulseEdges + 20 + pushRoom);
     if (leastShare > worstShare) leastShare = worstShare = 0;   // one burst: no share between two to measure
     ok = ok && sawDone && edgesOk && onTime && sharesOk && bursts == CALIBRATION_PULSES && !h.oddDuty
             && (h.logic.progress == 100) && (h.out.motorPermille == 0)
@@ -1171,17 +1201,17 @@ static void testB21()
     DispenserOutputs out = {0, true};
     dispenserInit(logic, 0, 0);
     out.motorPermille = 777;                  // must come back untouched when nothing is due
-    if (dispenserBurstStop(logic, 123456, out) || out.motorPermille != 777) ok = false;
+    if (dispenserBurstStop(logic, 1000, 123456, out) || out.motorPermille != 777) ok = false;
 
     logic.burstRunning   = true;
     logic.burstStopEdges = 0x00000010u;       // the count wraps before the burst ends
     out.motorPermille    = B_FULL;
-    if (dispenserBurstStop(logic, 0xFFFFFFF0u, out)) ok = false;
-    if (dispenserBurstStop(logic, 0x0000000Fu, out)) ok = false;
-    if (!dispenserBurstStop(logic, 0x00000010u, out)) ok = false;
+    if (dispenserBurstStop(logic, 1000, 0xFFFFFFF0u, out)) ok = false;
+    if (dispenserBurstStop(logic, 1000, 0x0000000Fu, out)) ok = false;
+    if (!dispenserBurstStop(logic, 1000, 0x00000010u, out)) ok = false;
     if (out.motorPermille != 0 || !out.motorForward || logic.burstRunning) ok = false;
     if (logic.prevOutput.motorPermille != 0) ok = false;
-    if (dispenserBurstStop(logic, 0x00000020u, out)) ok = false;   // once only
+    if (dispenserBurstStop(logic, 1000, 0x00000020u, out)) ok = false;   // once only
 
     // Continuous metering at the D defaults never marks a burst.
     BHarness h;
@@ -1330,7 +1360,7 @@ static void testB24()
     double   steady = bSteadyRPM(h, B_HALF);
 
     bool ok = reached && bAddsUp(got, want) && h.bursts == pulses && !h.oddDuty
-           && fabs(rpm - steady) <= 0.1 * steady && !h.sawClogged && !h.sawOverSpeed;
+           && fabs(rpm - steady) <= 0.1 * steady && !h.sawClogged && h.failures == 0 && !h.sawOverSpeed;
 
     reportCheck("B24", ok, "half PWM: every burst at %u permille %s, at %.0f RPM (the model's %.0f), %lu bursts "
                 "for %lu pulses, %.2f turns (want %.2f)",
@@ -1359,7 +1389,7 @@ static void testB25()
     double steady = bSteadyRPM(h, B_HALF);
 
     bool ok = bAddsUp(got, want) && !h.oddDuty && fabs(rpm - steady) <= 0.1 * steady
-           && !h.sawClogged && !h.sawOverSpeed;
+           && !h.sawClogged && h.failures == 0 && !h.sawOverSpeed;
 
     reportCheck("B25", ok, "heavy auger at half PWM: bursts at %.0f RPM (the model's %.0f), never pushed %s, "
                 "never Clogged %s, %.2f of %.2f turns",
@@ -1367,9 +1397,9 @@ static void testB25()
 }
 
 // B26 - an auger too heavy for half PWM: it takes 140 RPM off, leaving 34 RPM,
-// under the clog line of 54. The stall push gives it full PWM whenever it slows
-// under the line, so it keeps turning, is never called clogged, and the dose is
-// exact. Held for good, full PWM is tried and it clogs after CLOG_DETECT_MS.
+// under the stall line of 54. The stall push gives it full PWM whenever it slows
+// under the line, so it keeps turning, no burst fails, and the dose is exact.
+// Held for good, full PWM is tried and the burst fails after BURST_FAIL_MS.
 static void testB26()
 {
     BHarness h;
@@ -1388,31 +1418,32 @@ static void testB26()
     bFinish(h);
     double want    = (double)(h.logic.ledgerPulses - p0) * bRevsPerPulse(h);
     double got     = bTurns(h, e0);
-    bool   heavyOk = pushed && !h.sawClogged && !h.lowDuty && bAddsUp(got, want);
+    bool   heavyOk = pushed && h.failures == 0 && !h.sawClogged && !h.lowDuty && bAddsUp(got, want);
 
-    // And held for good: full PWM tried, then Clogged, motor off.
+    // And held for good: full PWM tried, then the burst fails, motor off.
     BHarness g;
     bHalfPwm(g);
     bRunPulses(g, 3, 30000);
     bool gInBurst = bUntilBurstSettled(g, 5000);
+    bWatch(g);
     g.blocked = true;
     uint32_t t0 = g.nowMs;
     bool gPushed = false;
-    bool clogged = false;
-    for (int i = 0; i < 3000 && !clogged; i++) {
+    for (int i = 0; i < (int)BURST_FAIL_MS + 1000 && g.failures == 0; i++) {
         bTick(g);
         if (g.out.motorPermille == B_FULL) gPushed = true;
-        clogged = (g.logic.mode == DispenserMode::Clogged);
     }
-    uint32_t tClog = g.nowMs - t0;
-    bool clogOk = gInBurst && gPushed && clogged && g.out.motorPermille == 0 && tClog >= CLOG_DETECT_MS
-               && tClog <= CLOG_DETECT_MS + 2 * MOTOR_CONTROL_INTERVAL_MS;
+    uint32_t tFail  = g.nowMs - t0;
+    DispenserMode after = (BURST_FAILS_BEFORE_UNCLOG > 1) ? DispenserMode::Normal : DispenserMode::AutoUnclogging;
+    bool     failOk = gInBurst && gPushed && g.failures == 1 && g.out.motorPermille == 0 &&
+                      g.logic.mode == after && tFail >= BURST_FAIL_MS &&
+                      tFail <= BURST_FAIL_MS + 2 * MOTOR_CONTROL_INTERVAL_MS;
 
-    bool ok = heavyOk && clogOk;
-    reportCheck("B26", ok, "too heavy for half PWM: pushed to full %s, bursts at %.0f RPM on average, never "
-                "Clogged %s, %.2f of %.2f turns; held for good: full PWM tried %s, Clogged after %lu ms %s",
-                pushed ? "yes" : "NO", rpm, h.sawClogged ? "NO" : "yes", got, want, gPushed ? "yes" : "NO",
-                (unsigned long)tClog, clogged ? "yes" : "NO");
+    bool ok = heavyOk && failOk;
+    reportCheck("B26", ok, "too heavy for half PWM: pushed to full %s, bursts at %.0f RPM on average, none "
+                "failed %s, %.2f of %.2f turns; held for good: full PWM tried %s, failed after %lu ms %s",
+                pushed ? "yes" : "NO", rpm, (h.failures == 0) ? "yes" : "NO", got, want,
+                gPushed ? "yes" : "NO", (unsigned long)tFail, failOk ? "yes" : "NO");
 }
 
 // B27 - the calibration run at half PWM: every step at half PWM, the same
@@ -1594,6 +1625,369 @@ static void testB30()
 }
 
 // ---------------------------------------------------------------------------
+// B31 - held for good with the machine moving on: every burst fails, and the
+// BURST_FAILS_BEFORE_UNCLOG-th in a row starts the unclog sequence by itself -
+// reverse first, then forward, UNCLOG_TOTAL_MS in all - after which metering
+// goes on, with no alarm at any point. Still blocked, it goes round again. At
+// this speed, a pulse every 785 ms (like 8 km/h on the machine's 1571 mm), the
+// failures never sound ZA SZYBKO either.
+// ---------------------------------------------------------------------------
+
+static void testB31()
+{
+    BHarness h;
+    bFresh(h);
+    uint32_t e0, p0;
+    bStart(h, e0, p0);
+    bWatch(h);
+    h.blocked = true;
+
+    for (int i = 0; i < 30000 && h.logic.mode != DispenserMode::AutoUnclogging; i++) bTick(h);
+    bool     reached    = (h.logic.mode == DispenserMode::AutoUnclogging);
+    uint32_t firstRound = h.failures;
+
+    // Through the sequence, and back to Normal.
+    uint32_t tStart       = h.nowMs;
+    bool     sawReverse   = false;
+    bool     sawForward   = false;
+    bool     reverseFirst = false;
+    for (int i = 0; i < (int)UNCLOG_TOTAL_MS + 1000 && h.logic.mode == DispenserMode::AutoUnclogging; i++) {
+        bTick(h);
+        if (h.logic.mode != DispenserMode::AutoUnclogging || h.out.motorPermille != UNCLOG_PERMILLE) continue;
+        if (!h.out.motorForward) {
+            if (!sawForward) reverseFirst = true;
+            sawReverse = true;
+        } else {
+            sawForward = true;
+        }
+    }
+    uint32_t took   = h.nowMs - tStart;
+    bool     back   = (h.logic.mode == DispenserMode::Normal);
+    bool     timeOk = took >= UNCLOG_TOTAL_MS && took <= UNCLOG_TOTAL_MS + 2 * MOTOR_CONTROL_INTERVAL_MS;
+
+    // Still blocked: round again.
+    for (int i = 0; i < 30000 && h.logic.mode != DispenserMode::AutoUnclogging; i++) bTick(h);
+    bool again = (h.logic.mode == DispenserMode::AutoUnclogging);
+
+    bool ok = reached && firstRound == BURST_FAILS_BEFORE_UNCLOG && reverseFirst && sawReverse && sawForward &&
+              back && timeOk && again && h.failures == 2u * BURST_FAILS_BEFORE_UNCLOG && !h.sawClogged &&
+              !h.sawOverSpeed;
+
+    reportCheck("B31", ok, "held for good: unclogs by itself after %lu failures (want %u), reverse first %s, "
+                "forward %s, metering again after %lu ms %s; round again %s; never Clogged %s, no ZA SZYBKO %s",
+                (unsigned long)firstRound, (unsigned)BURST_FAILS_BEFORE_UNCLOG, reverseFirst ? "yes" : "NO",
+                sawForward ? "yes" : "NO", (unsigned long)took, back ? "yes" : "NO", again ? "yes" : "NO",
+                h.sawClogged ? "NO" : "yes", h.sawOverSpeed ? "NO" : "yes");
+}
+
+// ---------------------------------------------------------------------------
+// B32 - "in a row" means nothing got through in between: one failure short of
+// an unclog, a burst that reaches its count, as many again - and no unclog.
+// Then the unclog sequence's own rules: the tractor going quiet does not stop
+// it, the dispenser switched off does.
+// ---------------------------------------------------------------------------
+
+static void testB32()
+{
+    if (BURST_FAILS_BEFORE_UNCLOG < 2) {
+        reportSkipped("B32", "BURST_FAILS_BEFORE_UNCLOG is 1: every failure unclogs at once (B31)");
+        return;
+    }
+    const uint32_t shortOf = BURST_FAILS_BEFORE_UNCLOG - 1;
+
+    BHarness h;
+    bFresh(h);
+    uint32_t e0, p0;
+    bStart(h, e0, p0);
+    bWatch(h);
+
+    h.blocked = true;
+    for (int i = 0; i < 30000 && h.failures < shortOf; i++) bTick(h);
+    bool failed = h.failures == shortOf && h.logic.burstFailStreak == shortOf;
+
+    // One gets through.
+    h.blocked = false;
+    for (int i = 0; i < 5000 && h.logic.burstFailStreak != 0; i++) bTick(h);
+    bool cleared = (h.logic.burstFailStreak == 0);
+
+    // As many again: never BURST_FAILS_BEFORE_UNCLOG in a row.
+    h.blocked = true;
+    for (int i = 0; i < 30000 && h.failures < 2 * shortOf; i++) bTick(h);
+    bool noUnclog = failed && h.failures == 2 * shortOf && h.logic.burstFailStreak == shortOf && !h.sawAutoUnclog;
+
+    // The next one in a row unclogs; the tractor going quiet does not stop it.
+    for (int i = 0; i < 20000 && h.logic.mode != DispenserMode::AutoUnclogging; i++) bTick(h);
+    h.tractorAlive = false;
+    bRun(h, 1000);
+    bool noTractor = (h.logic.mode == DispenserMode::AutoUnclogging);
+
+    // Switched off: over at the next step.
+    h.tractorAlive = true;
+    h.command.dispenserEnabled = 0;
+    bRun(h, MOTOR_CONTROL_INTERVAL_MS + 10);
+    bool offStops = h.logic.mode == DispenserMode::Normal && h.out.motorPermille == 0;
+
+    bool ok = cleared && noUnclog && noTractor && offStops && !h.sawClogged;
+    reportCheck("B32", ok, "%lu failures, one through, %lu more: run cleared %s, no unclog %s; the unclog goes on "
+                "without the tractor %s, stops when switched off %s",
+                (unsigned long)shortOf, (unsigned long)shortOf, cleared ? "yes" : "NO", noUnclog ? "yes" : "NO",
+                noTractor ? "yes" : "NO", offStops ? "yes" : "NO");
+}
+
+// ---------------------------------------------------------------------------
+// B33 - the seeding simulation, standing still: one burst per pulse that
+// SIMULATION_SPEED_MM_S would give at the tractor's distance per pulse, added
+// up as in work and counted; after SIMULATION_DURATION_MS it is SimulationDone,
+// motor off, holding its counts until the request is withdrawn. Withdrawn
+// early, or the tractor gone, it simply stops.
+// ---------------------------------------------------------------------------
+
+// Arms and starts a simulation with the machine standing. True once it runs.
+static bool bStartSimulation(BHarness &h)
+{
+    h.speedMmS = 0.0;                         // the seeder says stopped, and sends no pulses
+    bRun(h, MOTOR_CONTROL_INTERVAL_MS + 10);  // simulationRun 0 arms it
+    h.command.simulationRun = 1;
+    for (int i = 0; i < 500; i++) {
+        bTick(h);
+        if (h.logic.mode == DispenserMode::Simulating) return true;
+    }
+    return false;
+}
+
+// The pulses the simulation has given by now.
+static uint32_t bSimPulses(const BHarness &h)
+{
+    uint32_t t = h.nowMs - h.logic.simStartMs;
+    return (uint32_t)((uint64_t)t * SIMULATION_SPEED_MM_S / (1000ULL * h.mmPerPulse));
+}
+
+static void testB33()
+{
+    // The machine's own numbers - the bench's factor of 1778 at 7 km/h would be
+    // beyond the motor, and the tractor never sends more than 999.
+    BHarness h;
+    bFresh(h);
+    h.mmPerPulse               = 1571;
+    h.command.burstAngleFactor = DEFAULT_ANGLE_FACTOR;
+    bool started = bStartSimulation(h);
+    uint32_t e0 = h.edges;
+    bWatch(h);
+
+    // A minute of it, as in work.
+    bRun(h, 60000);
+    bUntilIdle(h, 5000);
+    uint32_t pulses  = bSimPulses(h);
+    double   want    = (double)pulses * bRevsPerPulse(h);
+    double   got     = bTurns(h, e0);
+    uint8_t  percent = h.logic.progress;
+    uint32_t tNow    = h.nowMs - h.logic.simStartMs;
+    bool asWork = started && bAddsUp(got, want) && h.logic.simBursts == pulses && h.logic.simFailures == 0 &&
+                  h.failures == 0 && !h.sawOverSpeed && !h.sawClogged &&
+                  percent == (uint8_t)((uint64_t)tNow * 100ULL / SIMULATION_DURATION_MS);
+
+    // The rest of it, skipped: the end is the clock's, not the shaft's.
+    uint16_t bursts = h.logic.simBursts;
+    h.nowMs = h.logic.simStartMs + SIMULATION_DURATION_MS;
+    bRun(h, MOTOR_CONTROL_INTERVAL_MS + 10);
+    bool done = h.logic.mode == DispenserMode::SimulationDone && h.logic.progress == 100 &&
+                h.out.motorPermille == 0;
+    bRun(h, 2000);
+    bool holds = h.logic.mode == DispenserMode::SimulationDone && h.logic.simBursts == bursts;
+    h.command.simulationRun = 0;
+    bRun(h, MOTOR_CONTROL_INTERVAL_MS + 10);
+    bool back = (h.logic.mode == DispenserMode::Normal) && h.logic.simBursts == bursts;
+
+    // Withdrawn early, and the tractor gone: over at once.
+    BHarness w;
+    bFresh(w);
+    bool wStarted = bStartSimulation(w);
+    bRun(w, 3000);
+    w.command.simulationRun = 0;
+    bRun(w, MOTOR_CONTROL_INTERVAL_MS + 10);
+    bool withdrawn = wStarted && w.logic.mode == DispenserMode::Normal;
+    bStartSimulation(w);
+    bRun(w, 3000);
+    w.tractorAlive = false;
+    bRun(w, MOTOR_CONTROL_INTERVAL_MS + 10);
+    bool noTractor = (w.logic.mode == DispenserMode::Normal);
+
+    bool ok = asWork && done && holds && back && withdrawn && noTractor;
+    reportCheck("B33", ok, "simulation, a minute: %u bursts for %lu pulses, %.2f turns (want %.2f), %u %%; done "
+                "at the end %s, holds %s, back to Normal %s; withdrawn %s, tractor gone %s",
+                (unsigned)bursts, (unsigned long)pulses, got, want, (unsigned)percent, done ? "yes" : "NO",
+                holds ? "yes" : "NO", back ? "yes" : "NO", withdrawn ? "yes" : "NO", noTractor ? "yes" : "NO");
+}
+
+// ---------------------------------------------------------------------------
+// B34 - failed bursts in the simulation act as in work: held for good, every
+// burst fails, and BURST_FAILS_BEFORE_UNCLOG in a row run the unclog sequence -
+// inside the simulation, which goes on after it - all of it counted, and the
+// tractor's LED count too. Refused with the machine moving, and in continuous
+// metering, which has no bursts to fail.
+// ---------------------------------------------------------------------------
+
+static void testB34()
+{
+    BHarness h;
+    bFresh(h);
+    bool started = bStartSimulation(h);
+    bWatch(h);
+    h.blocked = true;
+    for (int i = 0; i < 30000 && h.logic.simUnclogs == 0; i++) bTick(h);
+    bool unclogs = started && h.logic.simUnclogs == 1 && h.logic.simFailures == BURST_FAILS_BEFORE_UNCLOG &&
+                   h.logic.mode == DispenserMode::Simulating && h.failures == h.logic.simFailures;
+
+    bool reversed = false;
+    for (int i = 0; i < (int)UNCLOG_TOTAL_MS + 500 && h.logic.simUnclogging; i++) {
+        bTick(h);
+        if (h.out.motorPermille == UNCLOG_PERMILLE && !h.out.motorForward) reversed = true;
+    }
+    bool resumed = !h.logic.simUnclogging && h.logic.mode == DispenserMode::Simulating;
+
+    // Still blocked: failing again, inside the same simulation.
+    for (int i = 0; i < 30000 && h.logic.simUnclogs < 2; i++) bTick(h);
+    bool again = h.logic.simUnclogs == 2 && h.logic.simFailures == 2u * BURST_FAILS_BEFORE_UNCLOG &&
+                 !h.sawClogged && !h.sawAutoUnclog && !h.sawOverSpeed;
+
+    BHarness m;
+    bFresh(m);
+    bRun(m, MOTOR_CONTROL_INTERVAL_MS + 10);
+    m.command.simulationRun = 1;
+    bRun(m, 300);
+    bool refusedMoving = (m.logic.mode == DispenserMode::Refused);
+    m.command.simulationRun = 0;
+    bRun(m, MOTOR_CONTROL_INTERVAL_MS + 10);
+    bool refusedClears = (m.logic.mode == DispenserMode::Normal);
+
+    BHarness c;
+    bFresh(c);
+    c.logic.burstMode = false;
+    bool continuousRefused = !bStartSimulation(c) && c.logic.mode == DispenserMode::Refused;
+
+    bool ok = unclogs && reversed && resumed && again && refusedMoving && refusedClears && continuousRefused;
+    reportCheck("B34", ok, "held for good in the simulation: unclogs inside it after %u failures %s, reverse %s, "
+                "goes on %s, again %s; refused moving %s (clears %s), in continuous metering %s",
+                (unsigned)BURST_FAILS_BEFORE_UNCLOG, unclogs ? "yes" : "NO", reversed ? "yes" : "NO",
+                resumed ? "yes" : "NO", again ? "yes" : "NO", refusedMoving ? "yes" : "NO",
+                refusedClears ? "yes" : "NO", continuousRefused ? "yes" : "NO");
+}
+
+// ---------------------------------------------------------------------------
+// B35 - the push backwards after every burst: BURST_BACKLASH_DELAY_MS after a
+// burst stops, BURST_BACKLASH_PERMILLE backwards for BURST_BACKLASH_MS, then
+// off - and no burst in the meantime. In work, in the calibration run, in the
+// simulation, and after a failed burst; not when the failure unclogs instead,
+// and cut short when the dispenser is switched off.
+// ---------------------------------------------------------------------------
+
+// Runs until a burst stops, then times what follows: the gap to the push, its
+// duty and length, and whether anything drove forward before it was over.
+static bool bTimePush(BHarness &h, uint32_t &gapMs, uint32_t &lenMs, uint16_t &duty, bool &forwardInside)
+{
+    bool wasForward = false;
+    uint32_t tStop = 0, tPush = 0;
+    forwardInside = false;
+    duty = 0;
+    for (int i = 0; i < 20000; i++) {
+        bTick(h);
+        bool forward = h.out.motorPermille > 0 && h.out.motorForward;
+        bool back    = h.out.motorPermille > 0 && !h.out.motorForward;
+        if (tStop == 0) {
+            if (wasForward && !forward) tStop = h.nowMs;
+            wasForward = forward;
+            continue;
+        }
+        if (tPush == 0) {
+            if (forward) forwardInside = true;
+            if (back) {
+                tPush = h.nowMs;
+                duty  = h.out.motorPermille;
+            }
+            continue;
+        }
+        if (forward) forwardInside = true;
+        if (!back) {
+            gapMs = tPush - tStop;
+            lenMs = h.nowMs - tPush;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void testB35()
+{
+    if (BURST_BACKLASH_MS == 0 || BURST_BACKLASH_PERMILLE == 0) {
+        reportSkipped("B35", "the push backwards is switched off (BURST_BACKLASH_MS or _PERMILLE 0)");
+        return;
+    }
+
+    // In work.
+    BHarness h;
+    bFresh(h);
+    uint32_t e0, p0;
+    bStart(h, e0, p0);
+    uint32_t gap = 0, len = 0;
+    uint16_t duty = 0;
+    bool     forwardInside = true;
+    bool     timed = bTimePush(h, gap, len, duty, forwardInside);
+    bool     workOk = timed && duty == BURST_BACKLASH_PERMILLE && !forwardInside &&
+                      gap >= BURST_BACKLASH_DELAY_MS && gap <= BURST_BACKLASH_DELAY_MS + 1 &&
+                      len >= BURST_BACKLASH_MS && len <= BURST_BACKLASH_MS + 1;
+
+    // In the calibration run: one after every burst but the last, which Done cuts.
+    BHarness c;
+    bFresh(c);
+    c.mmPerPulse               = 2500;             // separate bursts, as in B13
+    c.command.burstAngleFactor = 889;
+    bStartCalibration(c);
+    bWatch(c);
+    bCalibrateToEnd(c, 120000);
+    bool calibOk = c.bursts == CALIBRATION_PULSES && c.pushes + 1 >= c.bursts && c.pushes <= c.bursts;
+
+    // In the simulation.
+    BHarness s;
+    bFresh(s);
+    s.mmPerPulse               = 1571;
+    s.command.burstAngleFactor = DEFAULT_ANGLE_FACTOR;
+    bStartSimulation(s);
+    bWatch(s);
+    bRun(s, 30000);
+    bool simOk = s.bursts >= 30 && s.pushes + 1 >= s.bursts && s.pushes <= s.bursts;
+
+    // After failed bursts: a push after each but the one that unclogs.
+    BHarness f;
+    bFresh(f);
+    bStart(f, e0, p0);
+    bWatch(f);
+    f.blocked = true;
+    for (int i = 0; i < 30000 && f.logic.mode != DispenserMode::AutoUnclogging; i++) bTick(f);
+    bool failOk = f.failures == BURST_FAILS_BEFORE_UNCLOG &&
+                  f.pushes == (uint32_t)(BURST_FAILS_BEFORE_UNCLOG - 1) + f.bursts - f.failures;
+
+    // Switched off in the middle of one: over at the next step.
+    BHarness o;
+    bFresh(o);
+    bStart(o, e0, p0);
+    bool gotPush = false;
+    for (int i = 0; i < 20000 && !gotPush; i++) {
+        bTick(o);
+        gotPush = o.logic.backlash == BacklashPush::Pushing;
+    }
+    o.command.dispenserEnabled = 0;
+    bRun(o, MOTOR_CONTROL_INTERVAL_MS + 10);
+    bool offOk = gotPush && o.out.motorPermille == 0 && o.logic.backlash == BacklashPush::None;
+
+    bool ok = workOk && calibOk && simOk && failOk && offOk;
+    reportCheck("B35", ok, "push back: %lu ms after the stop, %u permille for %lu ms, no burst inside %s; in "
+                "calibration %lu for %lu bursts, simulation %lu for %lu; after failures %s; off stops it %s",
+                (unsigned long)gap, (unsigned)duty, (unsigned long)len, forwardInside ? "NO" : "yes",
+                (unsigned long)c.pushes, (unsigned long)c.bursts, (unsigned long)s.pushes,
+                (unsigned long)s.bursts, failOk ? "yes" : "NO", offOk ? "yes" : "NO");
+}
+
+// ---------------------------------------------------------------------------
 
 static void runBurstTests()
 {
@@ -1631,6 +2025,11 @@ static void runBurstTests()
     testB28();
     testB29();
     testB30();
+    testB31();
+    testB32();
+    testB33();
+    testB34();
+    testB35();
 
     reportCheck("B19", b19Ok && b19Count > 0,
                 "dispenserFillStatus matched the step, with the averaged RPM, over %lu checks",

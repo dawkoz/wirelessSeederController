@@ -38,7 +38,14 @@ static constexpr uint8_t PROTOCOL_MAGIC_1 = 'S';
 // v6: TractorCommand carries burstAngleFactor, the burst-mode calibration: the
 //     angle each wheel pulse's burst turns is set on the tractor as a factor,
 //     not worked out from the grams-per-100-revolutions calibration.
-static constexpr uint8_t PROTOCOL_VERSION = 6;
+// v7: burst metering no longer stops for a clog. A stalled burst is tried
+//     again with the next pulse, and after BURST_FAILS_BEFORE_UNCLOG in a row
+//     the dispenser unclogs by itself (DispenserMode::AutoUnclogging).
+//     DispenserStatus counts the failed bursts, and the tractor blinks on each.
+// v8: the seeding simulation - TractorCommand.simulationRun asks for it,
+//     DispenserMode::Simulating and SimulationDone report it, and
+//     DispenserStatus carries its counts.
+static constexpr uint8_t PROTOCOL_VERSION = 8;
 
 static const uint8_t BROADCAST_ADDRESS[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -68,7 +75,7 @@ enum class DispenserFault : uint8_t {
 };
 
 // What the dispenser is doing. DispenserStatus.faultCode is only meaningful
-// in Normal.
+// in Normal and Simulating.
 enum class DispenserMode : uint8_t {
     Normal          = 0,   // metering to ground speed (motor off while not moving, off, or no seeder)
     Calibrating     = 1,   // automated calibration run turning the shaft
@@ -76,6 +83,12 @@ enum class DispenserMode : uint8_t {
     Refused         = 3,   // run refused or stopped because the machine is moving
     Clogged         = 4,   // shaft blocked, motor off, waiting for Anuluj or Odetkaj
     Unclogging      = 5,   // running the reverse/forward sequence
+    AutoUnclogging  = 6,   // burst metering: the same sequence, started by the dispenser
+                           // itself after failed bursts; back to Normal after it, no alarm
+    Simulating      = 7,   // burst metering as in work, standing still, on pulses at
+                           // SIMULATION_SPEED_MM_S - the tractor's endurance test
+    SimulationDone  = 8,   // SIMULATION_MINUTES are up, motor off, the counts final,
+                           // until the tractor withdraws the request
 };
 
 struct __attribute__((packed)) MessageHeader {
@@ -137,8 +150,10 @@ struct __attribute__((packed)) TractorCommand {
                                  // (burstRevsPerPulse() in dispenser_logic.h).
                                  // Unused in continuous metering, which goes by
                                  // gramsPer100Rev and the dose.
+    uint8_t  simulationRun;      // level-triggered like calibrationRun: 1 = run
+                                 // the seeding simulation now, 0 = don't / stop
 };
-static_assert(sizeof(TractorCommand) == 28, "TractorCommand layout changed - reflash ALL boards");
+static_assert(sizeof(TractorCommand) == 29, "TractorCommand layout changed - reflash ALL boards");
 
 // Both receivers clamp the wire value the same way: anything outside the limits
 // - including the 0 a board that does not set it yet would send - falls back to
@@ -158,10 +173,20 @@ struct __attribute__((packed)) DispenserStatus {
     uint8_t        motorRunning;
     DispenserFault faultCode;
     DispenserMode  mode;
-    uint8_t        progressPercent;   // 0..100 while Calibrating or Unclogging,
-                                      // 100 in CalibrationDone, 0 otherwise
+    uint8_t        progressPercent;   // 0..100 while Calibrating, Unclogging,
+                                      // AutoUnclogging or Simulating, 100 in
+                                      // CalibrationDone and SimulationDone, 0 otherwise
+    uint8_t        burstFailures;     // burst metering: +1 for every burst that
+                                      // stalled (BURST_FAIL_MS), wrapping 255 -> 0. A
+                                      // counter repeated in every packet, like the
+                                      // tractor's clogClearSeq: the tractor blinks
+                                      // its yellow LED once per change.
+    uint16_t       simBursts;         // the seeding simulation: bursts fired so far,
+    uint16_t       simFailures;       // of them failed,
+    uint8_t        simUnclogs;        // and unclog sequences they led to. Kept after
+                                      // it ends, until the next one starts.
 };
-static_assert(sizeof(DispenserStatus) == 18, "DispenserStatus layout changed - reflash ALL boards");
+static_assert(sizeof(DispenserStatus) == 24, "DispenserStatus layout changed - reflash ALL boards");
 
 // Why wheelPulses is cumulative rather than "pulses since the last packet":
 // ESP-NOW is lossy, and a per-interval count that goes missing is gone for

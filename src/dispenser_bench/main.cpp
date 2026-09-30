@@ -486,14 +486,14 @@ static void printMenu()
 {
     Serial.println();
     Serial.println("--- menu ------------------------------------------------------------------");
-    Serial.println("  d  logic tests (D01-D35, the ledger L01-L12, burst metering B01-B30, no hardware)");
+    Serial.println("  d  logic tests (D01-D35, the ledger L01-L12, burst metering B01-B35, no hardware)");
     Serial.println("  w  ground speed from wheel pulses (W01-W12, no hardware)");
     Serial.println("  v  packet tests (V01-V08, no motor)");
     Serial.println("  h  hardware (H00-H07, motor: read the checklist first)");
     Serial.println("  m  metering and links, continuous metering (M01-M11, motor)");
     Serial.println("  c  calibration run, continuous metering (C01-C06, motor)");
     Serial.println("  k  clog and unclogging, continuous metering (K01-K07, motor)");
-    Serial.println("  b  burst metering: bursts, over speed, calibration, clog (U01-U04, motor)");
+    Serial.println("  b  burst metering: bursts, over speed, calibration, stuck auger (U01-U04, motor)");
     Serial.println("  a  all of the above, in that order");
     Serial.println("  p  one simulated pass, continuous metering: pull away, seed 6 s, stop (P01, motor, not in a)");
     Serial.println("  r  report so far");

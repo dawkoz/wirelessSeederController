@@ -63,6 +63,10 @@ enum class Screen : uint8_t {
     SeedCalibResult,  // the measured value, or why there isn't one, screen 19
     Settings,         // everything stored, and the USB export, screen 20
     Blower,           // the blower alarm switch, screen 21
+    Tests,            // the tests, one per row, screen 22
+    SimConfirm,       // "Symulacja siewu" -> Anuluj / START, screen 23
+    SimRunning,       // the simulation, and how it ended, screens 24-27
+    SimResult,        // stopped with a long press: how far it got, screen 28
 };
 
 // What is actually on the display. One Screen can show as several Views
@@ -94,6 +98,13 @@ enum class View : uint8_t {
     SeedCalibResult,
     Settings,
     Blower,
+    Tests,
+    SimConfirm,
+    SimProgress,
+    SimDone,
+    SimRefused,
+    SimNoDispenser,
+    SimStopped,       // stopped early, by the operator or by the dispenser
 };
 
 enum class MenuItem : uint8_t {
@@ -104,13 +115,16 @@ enum class MenuItem : uint8_t {
     Nasiona    = 4,
     Ustawienia = 5,
     Dmuchawa   = 6,
-    Count      = 7,
+    Testy      = 7,
+    Count      = 8,
 };
 
 // More items than rows, so the menu scrolls: four are drawn from menuTop, which
 // follows the cursor.
 static const char *const MENU_LABELS[] = {"Praca", "Dawka", "Kalibracja", "Sciezki", "Nasiona", "Ustawienia",
-                                          "Dmuchawa"};
+                                          "Dmuchawa", "Testy"};
+static_assert(sizeof(MENU_LABELS) / sizeof(MENU_LABELS[0]) == (size_t)MenuItem::Count,
+              "MENU_LABELS must name every MenuItem, in the enum's order");
 static constexpr uint8_t MENU_VISIBLE_ROWS = 4;
 
 // What can take over the work screen. LinkLost is the exception: it is a letter
@@ -193,6 +207,37 @@ static uint8_t  seedCursor      = 0;      // screen 16: 0 Male, 1 Duze, 2 Kalibr
 static uint8_t  seedAskIndex    = 0;      // screen 17: 0 = Anuluj, 1 = OK
 static uint8_t  seedResultIndex = 0;      // screen 19: 0 = Anuluj, 1 = ZAPISZ
 
+// Screen 22 (Testy): tests of the machine standing still, a row each, then
+// Wroc - room for more to come. The seeding simulation only in burst metering,
+// which is where there are bursts to fail.
+enum class TestRow : uint8_t { Simulation, Back };
+static const TestRow TEST_ROWS_BURST[]      = {TestRow::Simulation, TestRow::Back};
+static const TestRow TEST_ROWS_CONTINUOUS[] = {TestRow::Back};
+static constexpr uint8_t TEST_ROW_COUNT     = DISPENSER_BURST_MODE ? 2 : 1;
+static uint8_t testsCursor = 0;
+
+static TestRow testRow(uint8_t index)
+{
+    return DISPENSER_BURST_MODE ? TEST_ROWS_BURST[index] : TEST_ROWS_CONTINUOUS[index];
+}
+
+// The seeding simulation (screens 23-28): simulationRequested goes out in every
+// command, like calibrationRequested. While the dispenser runs it the tractor
+// copies its counts and times it, so a run that ends early - a long press, or
+// the dispenser dropping it (simInterrupted, as for the calibration run) - can
+// still show how far it got.
+static uint8_t  simConfirmIndex      = 0;       // screen 23: 0 = Anuluj, 1 = START
+static bool     simulationRequested  = false;
+static bool     simInterrupted       = false;
+static bool     simStartWatchRunning = false;
+static uint32_t simStartWatchMs      = 0;
+static bool     simSeen              = false;   // the dispenser has reported it running since START
+static uint32_t simSeenAtMs          = 0;       // when it first did: the clock on screen 24
+static uint32_t simElapsedMs         = 0;
+static uint16_t simBursts            = 0;
+static uint16_t simFailures          = 0;
+static uint8_t  simUnclogs           = 0;
+
 // Why a calibration run produced no usable number. The result screen shows the
 // reason and offers nothing but Anuluj.
 enum class WheelCalibError : uint8_t { None, NoSeeder, SeederReset, TooFew, OutOfRange };
@@ -235,6 +280,16 @@ static bool     clogAcknowledged = false;
 static uint8_t  clogChoiceIndex  = 0;      // 0 = Anuluj, 1 = Odetkaj
 static uint8_t  clogClearSeq     = 0;      // +1 each time the operator picks Anuluj
 static uint8_t  unclogSeq        = 0;      // +1 each time the operator picks Odetkaj
+
+// Failed bursts on the dispenser (burst metering): its status counts them, and
+// every change blinks the yellow LED (BURST_FAIL_BLINKS) - the only sign of
+// them, by the user's choice. burstFailSynced is false until a status has been
+// taken as the starting point, at boot and after every loss of contact, so a
+// link gap or a dispenser reboot never blinks.
+static uint8_t  lastBurstFailures = 0;
+static bool     burstFailSynced   = false;
+static bool     burstBlinking     = false;
+static uint32_t burstBlinkStartMs = 0;
 
 // Calibration: interrupted means the dispenser sat in Normal after START
 // instead of calibrating (its side dropped the run), so the screen must tell
@@ -336,6 +391,7 @@ static void sendCommand(uint32_t now)
     command.unclogSeq        = unclogSeq;
     command.wheelMmPerPulse  = activeWheelMmPerPulse();
     command.burstAngleFactor = angleFactor;
+    command.simulationRun    = simulationRequested ? 1 : 0;
 
     broadcast(&command, sizeof(command), now);
 }
@@ -402,9 +458,10 @@ static const char *const VIEW_DEBUG_NAMES[] = {
     "Menu", "Work", "WorkFault", "EditDose", "EditCalibration", "EditAngle", "CalibMass", "Tramlines",
     "CalibConfirm", "CalibProgress", "CalibDone", "CalibRefused", "CalibNoDispenser", "CalibInterrupted",
     "ClogAlert", "ClogChoice", "Unclogging", "Seeds", "SeedCalibAsk", "SeedCalibRun",
-    "SeedCalibResult", "Settings", "Blower",
+    "SeedCalibResult", "Settings", "Blower", "Tests", "SimConfirm", "SimProgress", "SimDone",
+    "SimRefused", "SimNoDispenser", "SimStopped",
 };
-static_assert(sizeof(VIEW_DEBUG_NAMES) / sizeof(VIEW_DEBUG_NAMES[0]) == (size_t)View::Blower + 1,
+static_assert(sizeof(VIEW_DEBUG_NAMES) / sizeof(VIEW_DEBUG_NAMES[0]) == (size_t)View::SimStopped + 1,
               "VIEW_DEBUG_NAMES must name every View, in the enum's order");
 
 static const char *viewDebugName(View v)
@@ -804,6 +861,10 @@ static void handleMenu(ButtonEvent event)
                 screen = Screen::Blower;
                 blowerCursor = 0;     // cursor starts on the switch
                 break;
+            case MenuItem::Testy:
+                screen = Screen::Tests;
+                testsCursor = 0;      // cursor starts on the first test
+                break;
             default:
                 break;
         }
@@ -1136,6 +1197,73 @@ static void handleCalibDone(ButtonEvent event)
     if (DISPENSER_BURST_MODE) openMassEditor();
 }
 
+// Screen 22: a short press moves down the tests, a long one opens the one the
+// cursor is on.
+static void handleTests(ButtonEvent event)
+{
+    if (event == ButtonEvent::Short) {
+        testsCursor = (uint8_t)((testsCursor + 1) % TEST_ROW_COUNT);
+    } else if (event == ButtonEvent::Long) {
+        switch (testRow(testsCursor)) {
+            case TestRow::Simulation:
+                simConfirmIndex = 0;                  // default to Anuluj
+                screen = Screen::SimConfirm;
+                break;
+            default:
+                screen = Screen::Menu;
+                break;
+        }
+    }
+}
+
+// Screen 23: Anuluj (preselected) or START.
+static void handleSimConfirm(ButtonEvent event)
+{
+    if (event == ButtonEvent::Short) {
+        simConfirmIndex = (simConfirmIndex + 1) % 2;
+    } else if (event == ButtonEvent::Long) {
+        if (simConfirmIndex == 1) {
+            simulationRequested  = true;
+            simInterrupted       = false;
+            simStartWatchRunning = false;
+            simSeen              = false;
+            simElapsedMs         = 0;
+            simBursts            = 0;
+            simFailures          = 0;
+            simUnclogs           = 0;
+            screen = Screen::SimRunning;
+        } else {
+            screen = Screen::Tests;
+        }
+    }
+}
+
+// Withdraws the request, whatever state the run is in.
+static void stopSimulation()
+{
+    simulationRequested  = false;
+    simStartWatchRunning = false;
+}
+
+// Running, or waiting for the dispenser: only a long press stops it - a stray
+// short one must not throw away a quarter of an hour - and the screen then
+// shows how far it got.
+static void handleSimRunning(ButtonEvent event)
+{
+    if (event != ButtonEvent::Long) return;
+    stopSimulation();
+    screen = Screen::SimResult;
+}
+
+// Finished, refused or stopped: any press, back to the tests.
+static void handleSimFinished(ButtonEvent event)
+{
+    if (event == ButtonEvent::None) return;
+    stopSimulation();
+    simInterrupted = false;
+    screen = Screen::Tests;
+}
+
 static void handleWorkFault(ButtonEvent event)
 {
     // The pass number is hidden behind the fault screen, so a short press
@@ -1199,6 +1327,13 @@ static void handleView(View view, ButtonEvent event)
         case View::ClogAlert:         handleClogAlert(event);     break;
         case View::ClogChoice:        handleClogChoice(event);    break;
         case View::Unclogging:        break;   // nothing responds while the sequence runs
+        case View::Tests:             handleTests(event);         break;
+        case View::SimConfirm:        handleSimConfirm(event);    break;
+        case View::SimProgress:
+        case View::SimNoDispenser:    handleSimRunning(event);    break;
+        case View::SimDone:
+        case View::SimRefused:
+        case View::SimStopped:        handleSimFinished(event);   break;
     }
 }
 
@@ -1329,11 +1464,44 @@ static void updateScreenBookkeeping(uint32_t now)
             calibStartWatchRunning = false;
         }
     }
+
+    // The seeding simulation: copy its counts and time it while it runs, so a
+    // run that stops early can still show them. And, as for the calibration
+    // run, a dispenser that sits in Normal after START - or drops back to it
+    // part-way - has dropped the run.
+    if (screen == Screen::SimRunning && !simInterrupted) {
+        bool running = dispenserData.mode == DispenserMode::Simulating;
+        if (dispenserAlive && (running || dispenserData.mode == DispenserMode::SimulationDone)) {
+            if (!simSeen) {
+                simSeen     = true;
+                simSeenAtMs = now;
+            }
+            simElapsedMs = running ? now - simSeenAtMs : SIMULATION_DURATION_MS;
+            if (simElapsedMs > SIMULATION_DURATION_MS) simElapsedMs = SIMULATION_DURATION_MS;
+            simBursts   = dispenserData.simBursts;
+            simFailures = dispenserData.simFailures;
+            simUnclogs  = dispenserData.simUnclogs;
+        }
+        if (dispenserAlive && dispenserData.mode == DispenserMode::Normal) {
+            if (!simStartWatchRunning) {
+                simStartWatchRunning = true;
+                simStartWatchMs      = now;
+            }
+            if (now - simStartWatchMs >= CALIBRATION_START_TIMEOUT_MS) {
+                simInterrupted = true;
+                stopSimulation();
+            }
+        } else {
+            simStartWatchRunning = false;
+        }
+    }
 }
 
 // What the display currently shows. The clog overlay covers every screen
 // while the dispenser reports a clog (and only while it is alive - see the
-// trap about stale data).
+// trap about stale data). Burst metering's own unclog after failed bursts
+// (AutoUnclogging) shows nothing at all: the yellow LED's blinks are its only
+// sign, by the user's choice.
 static View currentView()
 {
     bool dispenserAlive = links.isAlive(NodeId::Dispenser);
@@ -1368,20 +1536,66 @@ static View currentView()
                 case DispenserMode::Refused:         return View::CalibRefused;
                 default:                             return View::CalibProgress;   // 0 % while starting
             }
+        case Screen::Tests:           return View::Tests;
+        case Screen::SimConfirm:      return View::SimConfirm;
+        case Screen::SimResult:       return View::SimStopped;
+        case Screen::SimRunning:
+            if (simInterrupted)                    return View::SimStopped;
+            if (!dispenserAlive)                   return View::SimNoDispenser;
+            switch (dispenserData.mode) {
+                case DispenserMode::SimulationDone:  return View::SimDone;
+                case DispenserMode::Refused:         return View::SimRefused;
+                default:                             return View::SimProgress;     // running, or starting
+            }
     }
     return View::Menu;
+}
+
+// A failed burst on the dispenser starts the yellow LED's blinks. Compared
+// only while the dispenser is heard; the first status after contact was lost,
+// or ever made, is only taken as the starting point.
+static void updateBurstFailBlink(uint32_t now)
+{
+    if (!dispenserEverSeen || !links.isAlive(NodeId::Dispenser)) {
+        burstFailSynced = false;
+        return;
+    }
+    if (!burstFailSynced) {
+        lastBurstFailures = dispenserData.burstFailures;
+        burstFailSynced   = true;
+        return;
+    }
+    if (dispenserData.burstFailures != lastBurstFailures) {
+        lastBurstFailures = dispenserData.burstFailures;
+        burstBlinking     = true;
+        burstBlinkStartMs = now;
+    }
 }
 
 // Serviced every loop iteration, so the buzzer can never be left stuck on by
 // a packet that stopped arriving mid-beep.
 static void updateOutputs(uint32_t now)
 {
-    // The clog alarm beeps over every screen, including ones that don't show
-    // it; the choice screen is quiet on purpose.
-    bool buzzing = (faultCode != FaultCode::None) || (currentView() == View::ClogAlert);
+    // Faults beep over every screen. The clog alarm did too, over screens that
+    // don't show it, until CLOG_ALARM_BUZZER turned that off; the choice screen
+    // is quiet either way.
+    bool buzzing = (faultCode != FaultCode::None) || (CLOG_ALARM_BUZZER && currentView() == View::ClogAlert);
     digitalWrite(BUZZER_PIN, (buzzing && (now % 500 < 250)) ? HIGH : LOW);
 
-    digitalWrite(YELLOW_LED_PIN, (seederEverSeen && seederData.tramlineRelayOn) ? HIGH : LOW);
+    // Yellow: the tramline relay, as the seeder last reported it - turned the
+    // other way BURST_FAIL_BLINKS times, BURST_FAIL_BLINK_MS each, after a
+    // failed burst, so the blinks show whether the relay holds it lit or not.
+    updateBurstFailBlink(now);
+    bool yellow = seederEverSeen && seederData.tramlineRelayOn;
+    if (burstBlinking) {
+        uint32_t t = now - burstBlinkStartMs;
+        if (t >= 2UL * BURST_FAIL_BLINKS * BURST_FAIL_BLINK_MS) {
+            burstBlinking = false;
+        } else if ((t / BURST_FAIL_BLINK_MS) % 2 == 0) {
+            yellow = !yellow;
+        }
+    }
+    digitalWrite(YELLOW_LED_PIN, yellow ? HIGH : LOW);
 
     if (anyLinkDown()) {
         digitalWrite(GREEN_LED_PIN, LOW);
@@ -1970,12 +2184,13 @@ static void drawCalibProgress()
     }
 }
 
-static void drawCalibNoDispenser()
+// Screens 10 and 26: the run the title names cannot reach the dispenser.
+static void drawNoDispenser(const char *title)
 {
     oled.setTextColor(WHITE);
     oled.setTextSize(1);
     oled.setCursor(0, 4);
-    oled.print("Kalibracja");
+    oled.print(title);
     oled.setTextSize(2);
     oled.setCursor(0, 24);
     oled.print("BRAK");
@@ -1983,12 +2198,14 @@ static void drawCalibNoDispenser()
     oled.print("DOZOWNIKA");
 }
 
-static void drawCalibRefused()
+// Screens 9 and 27: the run the title names was refused or stopped, because
+// the seeder reports the wheel turning.
+static void drawRefused(const char *title)
 {
     oled.setTextColor(WHITE);
     oled.setTextSize(1);
     oled.setCursor(0, 4);
-    oled.print("Kalibracja");
+    oled.print(title);
     oled.setTextSize(2);
     oled.setCursor(0, 22);
     oled.print("MASZYNA");
@@ -2066,6 +2283,155 @@ static void drawUnclogging()
     drawProgress("Odtykanie...", dispenserData.progressPercent);
 }
 
+// The simulation's speed in tenths of km/h, rounded: 1944 mm/s is 7.0.
+static constexpr uint32_t SIMULATION_KMH_TENTHS = ((uint32_t)SIMULATION_SPEED_MM_S * 36UL + 500UL) / 1000UL;
+
+static void printSimSpeed()
+{
+    oled.print(SIMULATION_KMH_TENTHS / 10);
+    oled.print('.');
+    oled.print(SIMULATION_KMH_TENTHS % 10);
+    oled.print(" km/h");
+}
+
+// Screen 22: the tests, a row each at text size 1 - the rows of screen 20 - so
+// longer names fit and more can follow; then Wroc.
+static void drawTests()
+{
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(0, 0);
+    oled.print("TESTY");
+
+    for (uint8_t i = 0; i < TEST_ROW_COUNT; i++) {
+        drawSettingsRow((int16_t)(14 + 12 * i), testsCursor == i);
+        if (testRow(i) == TestRow::Simulation) {
+            oled.print("Symulacja ");
+            oled.print(SIMULATION_MINUTES);
+        } else {
+            oled.print("Wroc");
+        }
+    }
+}
+
+// Screen 23, on the grid of the other confirm screens.
+static void drawSimConfirm()
+{
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(0, 4);
+    oled.print("Symulacja siewu");
+    oled.setCursor(0, 16);
+    printSimSpeed();
+    oled.print(", ");
+    oled.print(SIMULATION_MINUTES);
+    oled.print(" min");
+
+    oled.setTextSize(2);
+    drawSelectableLine(26, "Anuluj", simConfirmIndex == 0);
+    drawSelectableLine(46, "START",  simConfirmIndex == 1);
+}
+
+// mm:ss of a time in ms. Minutes stay under 100 (SIMULATION_MINUTES <= 99).
+static void printMinSec(uint32_t ms)
+{
+    uint32_t s = ms / 1000;
+    uint32_t m = s / 60;
+    s %= 60;
+    if (m < 10) oled.print('0');
+    oled.print(m);
+    oled.print(':');
+    if (s < 10) oled.print('0');
+    oled.print(s);
+}
+
+// The failed bursts as a share of all of them, to a tenth of a percent -
+// "--" before there is a burst to go by.
+static void printFailShare()
+{
+    if (simBursts == 0) {
+        oled.print("--");
+        return;
+    }
+    uint32_t tenths = ((uint32_t)simFailures * 1000UL + simBursts / 2) / simBursts;
+    oled.print(tenths / 10);
+    oled.print('.');
+    oled.print(tenths % 10);
+    oled.print('%');
+}
+
+// Screen 24: the simulation running - its clock, and the counts as the
+// dispenser reports them. The widest line, "Nieudane: 450 (40.4%)", is 21
+// characters: a run has room for no more failures than that, each taking at
+// least BURST_FAIL_MS and a pulse.
+static void drawSimProgress()
+{
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+
+    oled.setCursor(0, 0);
+    oled.print("Symulacja ");
+    printSimSpeed();
+
+    oled.setCursor(0, 11);
+    oled.print("Czas ");
+    printMinSec(simElapsedMs);
+    oled.print(" / ");
+    printMinSec(SIMULATION_DURATION_MS);
+
+    oled.setCursor(0, 22);
+    oled.print("Porcje: ");
+    oled.print(simBursts);
+
+    oled.setCursor(0, 33);
+    oled.print("Nieudane: ");
+    oled.print(simFailures);
+    oled.print(" (");
+    printFailShare();
+    oled.print(')');
+
+    oled.setCursor(0, 44);
+    oled.print("Odtykania: ");
+    oled.print(simUnclogs);
+
+    oled.setCursor(0, 55);
+    oled.print("Dlugi klik = stop");
+}
+
+// Screens 25 and 28: the result - the share of failed bursts, large, the counts
+// under it - after the whole run, or after as much of it as there was.
+static void drawSimResult(bool stopped)
+{
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(0, 0);
+    oled.print(stopped ? "Symulacja przerwana" : "Symulacja - koniec");
+
+    oled.setCursor(0, 10);
+    oled.print("Czas ");
+    printMinSec(simElapsedMs);
+    oled.print(", ");
+    printSimSpeed();
+
+    oled.setTextSize(2);
+    oled.setCursor(0, 20);
+    printFailShare();
+
+    oled.setTextSize(1);
+    oled.setCursor(0, 38);
+    oled.print("nieudane: ");
+    oled.print(simFailures);
+    oled.print(" z ");
+    oled.print(simBursts);
+
+    oled.setCursor(0, 47);
+    oled.print("odtykania: ");
+    oled.print(simUnclogs);
+
+    oled.setCursor(0, 56);
+    oled.print("Nacisnij aby wrocic");
+}
+
 static void redraw()
 {
     oled.clearDisplay();
@@ -2087,12 +2453,19 @@ static void redraw()
         case View::CalibConfirm:      drawCalibConfirm();     break;
         case View::CalibProgress:     drawCalibProgress();    break;
         case View::CalibDone:         drawCalibDone();        break;
-        case View::CalibRefused:      drawCalibRefused();     break;
-        case View::CalibNoDispenser:  drawCalibNoDispenser(); break;
+        case View::CalibRefused:      drawRefused("Kalibracja"); break;
+        case View::CalibNoDispenser:  drawNoDispenser("Kalibracja"); break;
         case View::CalibInterrupted:  drawCalibInterrupted(); break;
         case View::ClogAlert:         drawClogAlert();        break;
         case View::ClogChoice:        drawClogChoice();       break;
         case View::Unclogging:        drawUnclogging();       break;
+        case View::Tests:             drawTests();            break;
+        case View::SimConfirm:        drawSimConfirm();       break;
+        case View::SimProgress:       drawSimProgress();      break;
+        case View::SimDone:           drawSimResult(false);   break;
+        case View::SimStopped:        drawSimResult(true);    break;
+        case View::SimRefused:        drawRefused("Symulacja"); break;
+        case View::SimNoDispenser:    drawNoDispenser("Symulacja"); break;
     }
     oled.display();
 }
@@ -2260,7 +2633,7 @@ void loop()
     View liveView = currentView();
     bool live = (liveView == View::Work || liveView == View::WorkFault ||
                  liveView == View::CalibProgress || liveView == View::Unclogging ||
-                 liveView == View::SeedCalibRun ||
+                 liveView == View::SeedCalibRun || liveView == View::SimProgress ||
                  liveView == View::Settings);   // so the "sent" message clears itself
 
     if (displayDirty || (live && (now - lastDisplayMs >= DISPLAY_INTERVAL_MS))) {

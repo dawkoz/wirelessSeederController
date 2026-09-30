@@ -43,6 +43,9 @@ static const char *modeName(DispenserMode mode)
         case DispenserMode::Refused:         return "Refused";
         case DispenserMode::Clogged:         return "Clogged";
         case DispenserMode::Unclogging:      return "Unclogging";
+        case DispenserMode::AutoUnclogging:  return "AutoUnclogging";
+        case DispenserMode::Simulating:      return "Simulating";
+        case DispenserMode::SimulationDone:  return "SimulationDone";
         default:                             return "?";
     }
 }

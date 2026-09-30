@@ -23,7 +23,8 @@ static DispenserOutputs output;
 
 static uint32_t lastSendMs = 0;
 
-static DispenserMode lastLoggedMode = DispenserMode::Normal;
+static DispenserMode lastLoggedMode     = DispenserMode::Normal;
+static uint8_t       lastLoggedFailures = 0;
 
 static const char *modeName(DispenserMode mode)
 {
@@ -34,6 +35,9 @@ static const char *modeName(DispenserMode mode)
         case DispenserMode::Refused:         return "Refused";
         case DispenserMode::Clogged:         return "Clogged";
         case DispenserMode::Unclogging:      return "Unclogging";
+        case DispenserMode::AutoUnclogging:  return "AutoUnclogging";
+        case DispenserMode::Simulating:      return "Simulating";
+        case DispenserMode::SimulationDone:  return "SimulationDone";
         default:                             return "?";
     }
 }
@@ -128,14 +132,24 @@ void loop()
 {
     uint32_t now = millis();
 
-    if (dispenserControlTick(logic, now, output) && logic.mode != lastLoggedMode) {
-        Serial.print('[');
-        Serial.print(now);
-        Serial.print("] mode ");
-        Serial.print(modeName(lastLoggedMode));
-        Serial.print(" -> ");
-        Serial.println(modeName(logic.mode));
-        lastLoggedMode = logic.mode;
+    if (dispenserControlTick(logic, now, output)) {
+        if (logic.burstFailures != lastLoggedFailures) {
+            Serial.print('[');
+            Serial.print(now);
+            Serial.print("] burst failed (");
+            Serial.print(logic.burstFailures);
+            Serial.println(" since boot)");
+            lastLoggedFailures = logic.burstFailures;
+        }
+        if (logic.mode != lastLoggedMode) {
+            Serial.print('[');
+            Serial.print(now);
+            Serial.print("] mode ");
+            Serial.print(modeName(lastLoggedMode));
+            Serial.print(" -> ");
+            Serial.println(modeName(logic.mode));
+            lastLoggedMode = logic.mode;
+        }
     }
 
     sendStatus(now);

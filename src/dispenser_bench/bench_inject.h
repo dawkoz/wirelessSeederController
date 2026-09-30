@@ -47,6 +47,7 @@ struct SimTractor {
     uint16_t doseKgPerHa      = 40;
     uint32_t gramsPer100Rev   = 500;
     uint8_t  calibrationRun   = 0;
+    uint8_t  simulationRun    = 0;
     uint8_t  clogClearSeq     = 0;
     uint8_t  unclogSeq        = 0;
 
@@ -133,6 +134,7 @@ static int buildTractorPacket(const Injector &inj, uint32_t now, uint8_t *buf)
     packet.tramlineRelayOn  = 1;
     packet.dispenserEnabled = inj.tractor.dispenserEnabled;
     packet.calibrationRun   = inj.tractor.calibrationRun;
+    packet.simulationRun    = inj.tractor.simulationRun;
     packet.doseKgPerHa      = inj.tractor.doseKgPerHa;
     packet.gramsPer100Rev   = inj.tractor.gramsPer100Rev;
     packet.upTimeMs         = (uint32_t)((int64_t)now + inj.tractor.upTimeOffset);

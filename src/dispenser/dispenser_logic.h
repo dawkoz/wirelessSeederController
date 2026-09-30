@@ -33,6 +33,10 @@ struct DispenserOutputs {
     bool     motorForward;
 };
 
+// The push backwards after a burst (BURST_BACKLASH_MS): waiting out
+// BURST_BACKLASH_DELAY_MS for the shaft to stop, then pushing.
+enum class BacklashPush : uint8_t { None, Due, Pushing };
+
 struct DispenserLogic {
     // Step timing: prevStepMs is also set by dispenserInit, so the interval
     // check works from the very first step without a separate flag.
@@ -104,6 +108,31 @@ struct DispenserLogic {
     uint8_t  burstLatePulses = 0;
     float    averageRPM      = 0.0f;
 
+    // Failed bursts (BURST_FAIL_MS): burstFailStreak counts them in a row - a
+    // burst that reaches its count ends the run - and burstFailures all of
+    // them since boot, for the status, wrapping. After a failure burstWaitPulse
+    // holds the next attempt back until a new wheel pulse.
+    uint8_t  burstFailStreak = 0;
+    uint8_t  burstFailures   = 0;
+    bool     burstWaitPulse  = false;
+
+    // The push backwards after every burst: which phase it is in, and when
+    // that phase ends. Timed on every call of dispenserBacklashTick(), not only
+    // every control step - it is shorter than a step.
+    BacklashPush backlash      = BacklashPush::None;
+    uint32_t     backlashAtMs  = 0;
+
+    // The seeding simulation (Simulating). simulationArmed works like
+    // calibrationArmed. The counts are what the status reports, kept after a
+    // run until the next one starts; simUnclogging marks the unclog sequence
+    // running inside it, from unclogStartMs.
+    bool     simulationArmed = false;
+    uint32_t simStartMs      = 0;
+    uint16_t simBursts       = 0;
+    uint16_t simFailures     = 0;
+    uint8_t  simUnclogs      = 0;
+    bool     simUnclogging   = false;
+
     // The most recent step's output, after the reversal guard. It is what the
     // status reports and what the guard compares the next step against.
     DispenserOutputs prevOutput = {0, true};
@@ -122,9 +151,14 @@ inline void resetController(DispenserLogic &logic)
     // it stands for belongs to ground the machine has already left.
     logic.owedRevolutions  = 0.0f;
     logic.ledgerValid      = false;
-    // So does a burst: it was counting against that ledger.
+    // So does a burst: it was counting against that ledger. A run of failed
+    // bursts does not: it ends only when a burst gets through, or in the
+    // unclog sequence it leads to.
     logic.burstRunning     = false;
     logic.burstLatePulses  = 0;
+    logic.burstWaitPulse   = false;
+    // And the push backwards after one: the motor stops where it is.
+    logic.backlash         = BacklashPush::None;
 }
 
 inline void dispenserInit(DispenserLogic &logic, uint32_t nowMs, uint32_t edges)
@@ -150,6 +184,14 @@ inline void dispenserInit(DispenserLogic &logic, uint32_t nowMs, uint32_t edges)
     logic.burstPermille     = BURST_PERMILLE;
     logic.burstStopEdges    = 0;
     logic.averageRPM        = 0.0f;
+    logic.burstFailStreak   = 0;
+    logic.burstFailures     = 0;
+    logic.simulationArmed   = false;
+    logic.simStartMs        = 0;
+    logic.simBursts         = 0;
+    logic.simFailures       = 0;
+    logic.simUnclogs        = 0;
+    logic.simUnclogging     = false;
     logic.prevOutput.motorPermille = 0;
     logic.prevOutput.motorForward  = true;
     resetController(logic);
@@ -324,16 +366,16 @@ inline float ledgerCatchupRPM(DispenserLogic &logic, const DispenserInputs &in,
 // computeDuty never returns 1..MOTOR_MIN_RUNNING_PERMILLE, so "duty > 0" is
 // the same test as "duty >= MOTOR_MIN_RUNNING_PERMILLE".
 //
-// The timer itself: `slow` held for CLOG_DETECT_MS, one step at speed stops it.
+// The timer itself: `slow` held for limitMs, one step at speed stops it.
 // Shared by the continuous rule below and the burst rule after it.
-inline bool clogTimerExpired(DispenserLogic &logic, uint32_t nowMs, bool slow)
+inline bool clogTimerExpired(DispenserLogic &logic, uint32_t nowMs, bool slow, uint32_t limitMs)
 {
     if (slow) {
         if (!logic.clogTimerRunning) {
             logic.clogTimerRunning = true;
             logic.clogTimerStartMs = nowMs;
         }
-        return (nowMs - logic.clogTimerStartMs) >= CLOG_DETECT_MS;
+        return (nowMs - logic.clogTimerStartMs) >= limitMs;
     }
     logic.clogTimerRunning = false;
     return false;
@@ -349,7 +391,7 @@ inline bool clogDetected(DispenserLogic &logic, uint32_t nowMs, uint16_t targetR
     bool slow = (uint32_t)logic.measuredRPM * 100 <
                 (uint32_t)targetRPM * CLOG_MIN_SPEED_PERCENT;
 
-    return clogTimerExpired(logic, nowMs, slow);
+    return clogTimerExpired(logic, nowMs, slow, CLOG_DETECT_MS);
 }
 
 // What the burst PWM turns a free motor at: MOTOR_MAX_RPM at full PWM, and in
@@ -361,26 +403,28 @@ inline uint16_t burstNominalRPM(const DispenserLogic &logic)
     return (uint16_t)((uint32_t)logic.burstPermille * MOTOR_MAX_RPM / 1000);
 }
 
-// The clog check for burst metering and for the calibration run in burst mode.
+// The stall check for burst metering and for the calibration run in burst mode.
 // A burst's line is BURST_CLOG_MIN_RPM, or a third (CLOG_MIN_SPEED_PERCENT) of
-// burstNominalRPM if that is lower: a gentler burst must not be called clogged
-// for turning at the speed its PWM gives. The shaft is clogged when it stays
-// under the line for CLOG_DETECT_MS while driven. The first step of every burst
-// measures the standstill before it and starts the timer; the next one, at
-// speed, stops it again. A step with the motor off stops it as above.
+// burstNominalRPM if that is lower: a gentler burst must not be called stalled
+// for turning at the speed its PWM gives. The shaft has stalled when it stays
+// under the line for limitMs while driven - BURST_FAIL_MS in work, where it
+// fails the burst, CLOG_DETECT_MS in the calibration run, where it is a clog.
+// The first step of every burst measures the standstill before it and starts
+// the timer; the next one, at speed, stops it again. A step with the motor off
+// stops it as above.
 inline uint16_t burstClogLine(const DispenserLogic &logic)
 {
     uint32_t third = (uint32_t)burstNominalRPM(logic) * CLOG_MIN_SPEED_PERCENT / 100;
     return (third < BURST_CLOG_MIN_RPM) ? (uint16_t)third : BURST_CLOG_MIN_RPM;
 }
 
-inline bool burstClogDetected(DispenserLogic &logic, uint32_t nowMs, uint16_t duty)
+inline bool burstStalled(DispenserLogic &logic, uint32_t nowMs, uint16_t duty, uint32_t limitMs)
 {
     if (duty == 0) {
         logic.clogTimerRunning = false;
         return false;
     }
-    return clogTimerExpired(logic, nowMs, logic.measuredRPM < burstClogLine(logic));
+    return clogTimerExpired(logic, nowMs, logic.measuredRPM < burstClogLine(logic), limitMs);
 }
 
 // The duty for one step of a burst - of burst metering or of the calibration
@@ -390,7 +434,8 @@ inline bool burstClogDetected(DispenserLogic &logic, uint32_t nowMs, uint16_t du
 // that has slowed under the clog line after a whole step of being driven gets
 // full PWM at once - everything the motor has, to push through whatever holds
 // it - and the burst's own PWM again as soon as it turns. Only if even full PWM
-// does not move it for CLOG_DETECT_MS is it a clog. The first step of a burst,
+// does not move it does the burst fail (BURST_FAIL_MS; CLOG_DETECT_MS and a
+// clog in the calibration run). The first step of a burst,
 // after a step with the motor off (between bursts, or cut by
 // dispenserBurstStop()), is left alone: what it measured is the standstill
 // before the burst. At full PWM the exception changes nothing.
@@ -418,6 +463,40 @@ inline float burstRevsPerPulse(const DispenserLogic &logic, const DispenserInput
     return (float)in.command.burstAngleFactor / 1000.0f * refRevs;
 }
 
+// A burst has just ended - reached its count, or failed: the push backwards
+// (BURST_BACKLASH_MS) is due once the shaft has had BURST_BACKLASH_DELAY_MS to
+// stop. Nothing if it is switched off.
+inline void backlashAfterBurst(DispenserLogic &logic, uint32_t nowMs)
+{
+    if (BURST_BACKLASH_MS == 0 || BURST_BACKLASH_PERMILLE == 0) return;
+    logic.backlash     = BacklashPush::Due;
+    logic.backlashAtMs = nowMs + BURST_BACKLASH_DELAY_MS;
+}
+
+// The push backwards on its own clock, called on every loop() through
+// dispenserControlTick() - it is shorter than a control step - and by every step
+// as well, so it runs even where nothing calls it between steps. Starts the push
+// when due and ends it BURST_BACKLASH_MS later. Returns true when it has just
+// changed the motor, with out set to what to apply.
+inline bool dispenserBacklashTick(DispenserLogic &logic, uint32_t nowMs, DispenserOutputs &out)
+{
+    if (logic.backlash == BacklashPush::None) return false;
+    if ((int32_t)(nowMs - logic.backlashAtMs) < 0) return false;
+
+    if (logic.backlash == BacklashPush::Due) {
+        logic.backlash     = BacklashPush::Pushing;
+        logic.backlashAtMs = nowMs + BURST_BACKLASH_MS;
+        out.motorPermille  = BURST_BACKLASH_PERMILLE;
+        out.motorForward   = false;
+    } else {
+        logic.backlash     = BacklashPush::None;
+        out.motorPermille  = 0;
+        out.motorForward   = true;
+    }
+    logic.prevOutput = out;
+    return true;
+}
+
 // Burst metering, for a motor that cannot turn the loaded auger slowly: every
 // wheel pulse is dosed as one burst at the burst PWM (burstDuty), which ends
 // when the encoder has counted that pulse's angle (burstRevsPerPulse). A pulse
@@ -441,6 +520,11 @@ inline float burstRevsPerPulse(const DispenserLogic &logic, const DispenserInput
 // first step, and the seeder's counter going backwards (it rebooted). And what
 // is owed never survives a stop for want of seeder or dose, a clog or a mode
 // change (resetController), so it is never paid off in one spot afterwards.
+//
+// After a failed burst (BURST_FAIL_MS, handled in dispenserStep) nothing more
+// is tried until a new pulse arrives - the pause is what lets a wedged granule
+// settle, as it did when the operator pressed Anuluj - and a burst that reaches
+// its count ends the run of failures.
 //
 // Returns the step's fault: OverSpeed once BURST_LATE_PULSES pulses in a row
 // have found the motor still more than BURST_LATE_FRACTION of a pulse behind on
@@ -471,12 +555,19 @@ inline DispenserFault burstMeter(DispenserLogic &logic, const DispenserInputs &i
     logic.owedRevolutions -= (float)deltaEdges / (float)ENCODER_EDGES_PER_REV;
 
     if (deltaPulses > 0) {
-        if (logic.owedRevolutions > BURST_LATE_FRACTION * revsPerPulse) {
+        // Not while the shaft is stalled under the stall line (the timer runs
+        // from the step that measured it): a pulse finding the motor behind then
+        // is behind because the auger is stuck, which is a failed burst's
+        // business, not ZA SZYBKO's. A motor too slow for the machine turns.
+        if (logic.clogTimerRunning) {
+            // leave the count as it is
+        } else if (logic.owedRevolutions > BURST_LATE_FRACTION * revsPerPulse) {
             if (logic.burstLatePulses < 255) logic.burstLatePulses++;
         } else {
             logic.burstLatePulses = 0;
         }
         logic.owedRevolutions += (float)deltaPulses * revsPerPulse;
+        logic.burstWaitPulse   = false;      // after a failed burst: the next attempt
     }
 
     // Behind by more than BURST_MAX_BACKLOG_PULSES: the motor cannot keep up,
@@ -499,7 +590,9 @@ inline DispenserFault burstMeter(DispenserLogic &logic, const DispenserInputs &i
     // leave the remainder waiting for the next pulse, and after the last pulse
     // of a pass, for ever.
     float owedEdges = logic.owedRevolutions * (float)ENCODER_EDGES_PER_REV;
-    if (owedEdges >= (float)BURST_MIN_EDGES || (logic.burstRunning && owedEdges > 0.0f)) {
+    bool  owing     = owedEdges >= (float)BURST_MIN_EDGES || (logic.burstRunning && owedEdges > 0.0f);
+    bool  pushing   = logic.backlash != BacklashPush::None;   // the push after the last burst comes first
+    if (owing && !logic.burstWaitPulse && !pushing) {
         // Rounded up, so a finished burst leaves the ledger at or below zero
         // rather than a sliver that would start another one. Never more than a
         // billion edges ahead (two million turns - only a dose far beyond what
@@ -515,8 +608,20 @@ inline DispenserFault burstMeter(DispenserLogic &logic, const DispenserInputs &i
         logic.targetRPM      = burstNominalRPM(logic);
         next.motorPermille   = burstDuty(logic);
         next.motorForward    = true;
+    } else if (logic.burstWaitPulse || (owing && pushing)) {
+        // A burst has just failed - motor off until the next pulse - or the
+        // push backwards after the last one is still to finish. Nothing has
+        // been caught up, so the late count stands.
+        logic.burstRunning = false;
+        logic.targetRPM    = 0;
     } else {
-        // Caught up, so nothing is late any more.
+        // Caught up, so nothing is late any more - and a burst that was still
+        // running has reached its count, which ends a run of failures and
+        // brings its push backwards.
+        if (logic.burstRunning) {
+            logic.burstFailStreak = 0;
+            backlashAfterBurst(logic, in.nowMs);
+        }
         logic.burstRunning    = false;
         logic.burstLatePulses = 0;
         logic.targetRPM       = 0;
@@ -530,18 +635,21 @@ inline DispenserFault burstMeter(DispenserLogic &logic, const DispenserInputs &i
 // its count, instead of up to MOTOR_CONTROL_INTERVAL_MS later - at full speed
 // that is over half a turn. It only ever stops the motor, never starts it; the
 // next step takes whatever is owed from there, including the few edges the
-// shaft turns while it brakes. Returns true when it has just stopped the motor,
-// with out set to what to apply.
-inline bool dispenserBurstStop(DispenserLogic &logic, uint32_t encoderEdges, DispenserOutputs &out)
+// shaft turns while it brakes. A burst that gets here did not fail, so it also
+// ends a run of failed ones, and its push backwards is due. Returns true when it
+// has just stopped the motor, with out set to what to apply.
+inline bool dispenserBurstStop(DispenserLogic &logic, uint32_t nowMs, uint32_t encoderEdges, DispenserOutputs &out)
 {
     if (!logic.burstRunning) return false;
     if ((int32_t)(encoderEdges - logic.burstStopEdges) < 0) return false;
 
-    logic.burstRunning = false;
-    logic.targetRPM    = 0;
+    logic.burstRunning    = false;
+    logic.burstFailStreak = 0;
+    logic.targetRPM       = 0;
     out.motorPermille  = 0;
     out.motorForward   = true;
     logic.prevOutput   = out;
+    backlashAfterBurst(logic, nowMs);
     return true;
 }
 
@@ -571,7 +679,9 @@ inline uint32_t calibrationBurstEdges(const DispenserLogic &logic, const Dispens
 // count so far, so the braking of one is taken off the next and the run ends
 // on calibrationBurstEdges() for all the pulses. The pulses due are worked out
 // from the clock and the turns done from the encoder, so no burst can go
-// missing or run twice. Returns true when the shaft has clogged.
+// missing or run twice. Returns true when the shaft has clogged: stalled for
+// CLOG_DETECT_MS. Unlike a failed burst in work, that ends the run as Clogged -
+// the unclog sequence's reverse turns would count in the weighing.
 inline bool calibrationBurst(DispenserLogic &logic, const DispenserInputs &in, uint32_t turned,
                              DispenserOutputs &next)
 {
@@ -581,11 +691,15 @@ inline bool calibrationBurst(DispenserLogic &logic, const DispenserInputs &in, u
     if (pulses > CALIBRATION_PULSES) pulses = CALIBRATION_PULSES;
     uint32_t due = calibrationBurstEdges(logic, in, pulses);
 
-    if (turned >= due) {
-        // Between two pulses: motor off, which also stops the clog timer.
+    // Between two pulses, or the push backwards after the last burst still to
+    // finish (as in work): motor off - the push has its own output - which also
+    // stops the clog timer. A burst that ends here, not in dispenserBurstStop(),
+    // brings its push as well.
+    if (turned >= due || logic.backlash != BacklashPush::None) {
+        if (logic.burstRunning && turned >= due) backlashAfterBurst(logic, in.nowMs);
         logic.burstRunning = false;
         logic.targetRPM    = 0;
-        return burstClogDetected(logic, in.nowMs, 0);
+        return burstStalled(logic, in.nowMs, 0, CLOG_DETECT_MS);
     }
 
     logic.burstRunning   = true;
@@ -593,7 +707,59 @@ inline bool calibrationBurst(DispenserLogic &logic, const DispenserInputs &in, u
     logic.targetRPM      = burstNominalRPM(logic);
     next.motorPermille   = burstDuty(logic);
     next.motorForward    = true;
-    return burstClogDetected(logic, in.nowMs, next.motorPermille);
+    return burstStalled(logic, in.nowMs, next.motorPermille, CLOG_DETECT_MS);
+}
+
+// One step of the reverse/forward unclog sequence, t ms into it: the phase's
+// output into next. Shared by the operator's Odetkaj (Unclogging), burst
+// metering's own (AutoUnclogging) and the simulation's. No stall check: the
+// sequence runs to completion whatever the shaft does, and the encoder counts
+// up in both directions.
+inline void unclogOutput(uint32_t t, DispenserOutputs &next)
+{
+    uint32_t p = t % UNCLOG_CYCLE_MS;
+    if (p < UNCLOG_REVERSE_MS) {
+        next.motorPermille = UNCLOG_PERMILLE;
+        next.motorForward  = false;
+    } else if (p < UNCLOG_REVERSE_MS + UNCLOG_PAUSE_MS) {
+        // pause: duty 0, forward
+    } else if (p < UNCLOG_REVERSE_MS + UNCLOG_PAUSE_MS + UNCLOG_FORWARD_MS) {
+        next.motorPermille = UNCLOG_PERMILLE;
+        next.motorForward  = true;
+    } else {
+        // pause: duty 0, forward
+    }
+}
+
+// A failed burst (BURST_FAIL_MS) - a granule wedged in the auger, most likely -
+// and never a clog alarm. The motor stops, and what the burst still owed waits
+// for the next pulse, whose burst tries again. One pulse's worth at most:
+// enough to fill the gap this burst leaves, while a pulse arriving behind on it
+// is not late, so the failure alone never sounds ZA SZYBKO. The push backwards
+// follows it as it follows every burst - here it opens the backlash for the
+// retry. Returns true when it completes a run of BURST_FAILS_BEFORE_UNCLOG: time
+// for the unclog sequence instead, whose reverse starts next step - the
+// reversal guard would stop this one anyway, straight from driving forward.
+// Shared by work and the simulation.
+inline bool failBurst(DispenserLogic &logic, float revsPerPulse, uint32_t nowMs, DispenserOutputs &next)
+{
+    if (logic.owedRevolutions > revsPerPulse) logic.owedRevolutions = revsPerPulse;
+    logic.burstRunning     = false;
+    logic.burstWaitPulse   = true;
+    logic.burstLatePulses  = 0;
+    logic.targetRPM        = 0;
+    logic.clogTimerRunning = false;
+    logic.burstFailures++;                       // wraps; the tractor blinks on every change
+    if (logic.burstFailStreak < 255) logic.burstFailStreak++;
+    next.motorPermille = 0;
+    next.motorForward  = true;
+
+    if (logic.burstFailStreak < BURST_FAILS_BEFORE_UNCLOG) {
+        backlashAfterBurst(logic, nowMs);
+        return false;
+    }
+    logic.burstFailStreak = 0;
+    return true;
 }
 
 // One control step. Returns false (with out untouched) until
@@ -604,6 +770,12 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
     if (in.nowMs - logic.prevStepMs < MOTOR_CONTROL_INTERVAL_MS) return false;
     uint32_t elapsed = in.nowMs - logic.prevStepMs;
     logic.prevStepMs = in.nowMs;
+
+    // 0. The push backwards after a burst keeps its own time
+    //    (dispenserBacklashTick() on every loop); moved on here too, so it never
+    //    waits on a caller that does not tick it between steps.
+    DispenserOutputs pushOut = logic.prevOutput;
+    dispenserBacklashTick(logic, in.nowMs, pushOut);
 
     // 1. Measure: edges since the previous step, then the RPM over it. The
     //    64-bit maths keeps a long gap between steps from overflowing.
@@ -637,6 +809,7 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
         }
         logic.lastCommandUpTimeMs = in.command.upTimeMs;
         if (in.command.calibrationRun == 0) logic.calibrationArmed = true;
+        if (in.command.simulationRun == 0)  logic.simulationArmed  = true;
     }
     logic.tractorWasAlive = in.tractorAlive && in.haveCommand;
 
@@ -667,6 +840,27 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
                 break;
             }
 
+            // Start the seeding simulation? Armed the same way, and refused the
+            // same way while the machine moves - and in continuous metering,
+            // which has no bursts to fail.
+            bool simStart = in.tractorAlive && in.haveCommand &&
+                            in.command.simulationRun != 0 && logic.simulationArmed;
+            if (simStart) {
+                logic.simulationArmed = false;
+                if (!logic.burstMode || (in.seederAlive && in.haveTelemetry && in.telemetry.wheelTurning != 0)) {
+                    newMode = DispenserMode::Refused;
+                } else {
+                    newMode = DispenserMode::Simulating;
+                    logic.simStartMs    = in.nowMs;
+                    logic.simBursts     = 0;
+                    logic.simFailures   = 0;
+                    logic.simUnclogs    = 0;
+                    logic.simUnclogging = false;
+                    logic.progress      = 0;
+                }
+                break;
+            }
+
             // Without ground speed the dispenser cannot meter at all, so
             // running would apply an arbitrary unknown rate.
             if (!in.seederAlive || !in.haveTelemetry) {
@@ -693,15 +887,17 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
                     resetController(logic);
                     break;
                 }
-                newFault = burstMeter(logic, in, burstRevsPerPulse(logic, in), next);
-                if (burstClogDetected(logic, in.nowMs, next.motorPermille)) {
-                    // As below: motor off, and the reset and progress come with
-                    // the mode change.
-                    newMode            = DispenserMode::Clogged;
-                    newFault           = DispenserFault::None;
-                    logic.progress     = 0;
-                    next.motorPermille = 0;
-                    next.motorForward  = true;
+                float revsPerPulse = burstRevsPerPulse(logic, in);
+                newFault = burstMeter(logic, in, revsPerPulse, next);
+                if (burstStalled(logic, in.nowMs, next.motorPermille, BURST_FAIL_MS)) {
+                    newFault = DispenserFault::None;
+                    if (failBurst(logic, revsPerPulse, in.nowMs, next)) {
+                        // Failing again and again: the unclog sequence, by
+                        // itself, and back to metering after it.
+                        newMode             = DispenserMode::AutoUnclogging;
+                        logic.unclogStartMs = in.nowMs;
+                        logic.progress      = 0;
+                    }
                 }
                 break;
             }
@@ -804,12 +1000,74 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
             break;
         }
 
+        case DispenserMode::Simulating: {
+            // The seeding simulation: burst metering exactly as in work, failed
+            // bursts and their unclog included, standing still, on the pulses
+            // SIMULATION_SPEED_MM_S would give. Like the calibration run, the
+            // tractor asks for it and waits on it, so the request withdrawn or
+            // the tractor lost ends it, and so does the machine really moving.
+            if (!in.tractorAlive || !in.haveCommand || in.command.simulationRun == 0) {
+                newMode = DispenserMode::Normal;
+                break;
+            }
+            if (in.seederAlive && in.haveTelemetry && in.telemetry.wheelTurning != 0) {
+                newMode = DispenserMode::Refused;
+                break;
+            }
+            uint32_t t = in.nowMs - logic.simStartMs;
+            if (t >= SIMULATION_DURATION_MS) {
+                newMode = DispenserMode::SimulationDone;
+                logic.progress = 100;
+                break;
+            }
+            logic.progress = (uint8_t)((uint64_t)t * 100ULL / SIMULATION_DURATION_MS);
+
+            // The unclog sequence a run of failures started, as AutoUnclogging
+            // does in work - including metering afresh after it, the ground
+            // covered meanwhile left undosed.
+            if (logic.simUnclogging) {
+                uint32_t u = in.nowMs - logic.unclogStartMs;
+                if (u < UNCLOG_TOTAL_MS) {
+                    unclogOutput(u, next);
+                } else {
+                    logic.simUnclogging = false;
+                    resetController(logic);
+                }
+                break;
+            }
+
+            // The pulses the ground would have given since the start, at the
+            // tractor's distance per pulse, in place of the seeder's.
+            DispenserInputs sim = in;
+            uint32_t mmPerPulse = validWheelMmPerPulse(in.command.wheelMmPerPulse);
+            sim.telemetry.wheelPulses =
+                (uint32_t)((uint64_t)t * SIMULATION_SPEED_MM_S / (1000ULL * mmPerPulse));
+
+            float revsPerPulse = burstRevsPerPulse(logic, in);
+            bool  wasRunning   = logic.burstRunning;
+            newFault = burstMeter(logic, sim, revsPerPulse, next);
+            if (!wasRunning && logic.burstRunning && logic.simBursts < 65535) logic.simBursts++;
+            if (burstStalled(logic, in.nowMs, next.motorPermille, BURST_FAIL_MS)) {
+                newFault = DispenserFault::None;
+                if (logic.simFailures < 65535) logic.simFailures++;
+                if (failBurst(logic, revsPerPulse, in.nowMs, next)) {
+                    logic.simUnclogging = true;
+                    logic.unclogStartMs = in.nowMs;
+                    if (logic.simUnclogs < 255) logic.simUnclogs++;
+                }
+            }
+            break;
+        }
+
         case DispenserMode::CalibrationDone:
+        case DispenserMode::SimulationDone:
         case DispenserMode::Refused: {
             // Hold with the motor off until the tractor withdraws the
             // request, so the operator sees the result. Nothing else leaves
-            // these; the motor is off, so holding is safe.
-            if (in.tractorAlive && in.haveCommand && in.command.calibrationRun == 0) {
+            // these; the motor is off, so holding is safe. Refused can be
+            // either run's, so both requests have to be down.
+            if (in.tractorAlive && in.haveCommand && in.command.calibrationRun == 0 &&
+                in.command.simulationRun == 0) {
                 newMode = DispenserMode::Normal;
             }
             break;
@@ -850,28 +1108,37 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
                 logic.progress = 0;
                 break;
             }
-            uint32_t p = t % UNCLOG_CYCLE_MS;
-            if (p < UNCLOG_REVERSE_MS) {
-                next.motorPermille = UNCLOG_PERMILLE;
-                next.motorForward  = false;
-            } else if (p < UNCLOG_REVERSE_MS + UNCLOG_PAUSE_MS) {
-                // pause: duty 0, forward
-            } else if (p < UNCLOG_REVERSE_MS + UNCLOG_PAUSE_MS + UNCLOG_FORWARD_MS) {
-                next.motorPermille = UNCLOG_PERMILLE;
-                next.motorForward  = true;
-            } else {
-                // pause: duty 0, forward
-            }
+            unclogOutput(t, next);
             logic.progress = (uint8_t)((uint64_t)t * 100ULL / UNCLOG_TOTAL_MS);
-            // No clog check here: the sequence runs to completion whatever
-            // the shaft does, and the encoder counts up in both directions.
+            break;
+        }
+
+        case DispenserMode::AutoUnclogging: {
+            // Burst metering's own unclog, after BURST_FAILS_BEFORE_UNCLOG
+            // failed bursts in a row: the operator's sequence, except that
+            // nobody asked for it and nobody waits on it. It runs to the end
+            // whatever the tractor does - metering does not need the tractor
+            // either - and then metering simply goes on: Normal, which starts
+            // afresh, leaving the ground covered meanwhile undosed. The
+            // dispenser switched off, or nothing to dose, ends it at once.
+            bool nothingToDose = in.haveCommand && (in.command.dispenserEnabled == 0 ||
+                                                   in.command.doseKgPerHa == 0 ||
+                                                   in.command.burstAngleFactor == 0);
+            uint32_t t = in.nowMs - logic.unclogStartMs;
+            if (nothingToDose || t >= UNCLOG_TOTAL_MS) {
+                newMode = DispenserMode::Normal;
+                break;
+            }
+            unclogOutput(t, next);
+            logic.progress = (uint8_t)((uint64_t)t * 100ULL / UNCLOG_TOTAL_MS);
             break;
         }
     }
 
     // Every mode change resets the controller (integral 0, target 0, clog
-    // timer stopped). progressPercent is 0 in every mode except Calibrating
-    // and Unclogging (set above) and CalibrationDone (100, set above).
+    // timer stopped). progressPercent is 0 in every mode except Calibrating,
+    // Unclogging, AutoUnclogging and Simulating (set above) and CalibrationDone
+    // and SimulationDone (100, set above).
     if (newMode != logic.mode) {
         logic.mode = newMode;
         resetController(logic);
@@ -881,6 +1148,14 @@ inline bool dispenserStep(DispenserLogic &logic, const DispenserInputs &in, Disp
         }
     }
     logic.fault = newFault;
+
+    // A step that lands in the push backwards after a burst keeps it going:
+    // the modes hold the motor off meanwhile, and the push has its own output.
+    // A mode change has cancelled it above.
+    if (logic.backlash == BacklashPush::Pushing) {
+        next.motorPermille = BURST_BACKLASH_PERMILLE;
+        next.motorForward  = false;
+    }
 
     out = next;
 
@@ -914,4 +1189,8 @@ inline void dispenserFillStatus(const DispenserLogic &logic, DispenserStatus &st
     status.faultCode              = logic.fault;
     status.mode                   = logic.mode;
     status.progressPercent        = logic.progress;
+    status.burstFailures          = logic.burstFailures;
+    status.simBursts              = logic.simBursts;
+    status.simFailures            = logic.simFailures;
+    status.simUnclogs             = logic.simUnclogs;
 }

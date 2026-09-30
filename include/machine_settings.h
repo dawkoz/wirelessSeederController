@@ -47,13 +47,18 @@ static constexpr uint32_t LINK_TIMEOUT_MS = 1000; // a board silent this long co
 // All three are plain GPIOs: no strapping role, nothing driven during boot,
 // an input with no pull-up or pull-down while in reset, and internal pull-ups
 // and interrupts once running. During reset the relay board's own input circuit
-// decides, so an active-LOW board stays off until setup() takes the pin.
-static constexpr uint8_t RELAY_PIN = 18;          // relay board input, active LOW
+// decides: an active-HIGH board stays off only if that input has a pull-down
+// (most have one; if the relay clicks at power-up, fit 10k from the pin to
+// GND). setup() drives the pin low - off - before anything else.
+static constexpr uint8_t RELAY_PIN = 18;          // relay board input, active HIGH
 static constexpr uint8_t TURBINE_SENSOR_PIN = 19; // inductive sensor
 static constexpr uint8_t WHEEL_SENSOR_PIN = 22;   // Hall sensor on the metering drive (WHEEL_MAGNETS magnets)
 
-static constexpr uint8_t RELAY_ON = LOW; // the relay board is active LOW
-static constexpr uint8_t RELAY_OFF = HIGH;
+// The fitted relay board closes on a high input: with the LOW/HIGH of the
+// board it replaced, tramlines were on where they should be off and the other
+// way round (found in the field, 29 September 2026).
+static constexpr uint8_t RELAY_ON = HIGH;
+static constexpr uint8_t RELAY_OFF = LOW;
 
 // --- Ground wheel -----------------------------------------------------------
 
@@ -127,7 +132,7 @@ static constexpr uint32_t TURBINE_MIN_PULSE_GAP_US = 1000; // shorter gaps are e
 static constexpr uint8_t BUTTON_PIN = 32;
 static constexpr uint8_t GREEN_LED_PIN = 14;  // all links healthy; flickers during boot (GPIO14 does), harmless
 static constexpr uint8_t BLUE_LED_PIN = 27;   // blinks while a link is down
-static constexpr uint8_t YELLOW_LED_PIN = 13; // tramline relay on
+static constexpr uint8_t YELLOW_LED_PIN = 13; // tramline relay on; two quick blinks: a burst failed
 static constexpr uint8_t BUZZER_PIN = 19;
 static constexpr uint8_t OLED_I2C_ADDRESS = 0x3C;
 
@@ -194,6 +199,19 @@ static constexpr uint16_t TURBINE_RUNNING_MIN_RPM = 50;
 static constexpr uint32_t TURBINE_ALARM_DELAY_MS = 3000;
 
 static constexpr uint32_t LINK_BUZZER_DELAY_MS = 5000; // a lost link beeps only after this long
+
+// The clog alarm (ZATKANIE!, screen 12) is silent - the user's call, 29
+// September 2026: in the field it distracted more than it helped. Burst
+// metering never raises it in work any more (see BURST_FAIL_MS); the screen can
+// still come up, without the buzzer, for a clog in the calibration run or in
+// continuous metering.
+static constexpr bool CLOG_ALARM_BUZZER = false;
+
+// A failed burst on the dispenser blinks the yellow LED BURST_FAIL_BLINKS
+// times, BURST_FAIL_BLINK_MS on and as long off: two blinks in 0.4 s. While the
+// tramline relay holds the LED lit, the same blinks go dark instead.
+static constexpr uint8_t BURST_FAIL_BLINKS = 2;
+static constexpr uint32_t BURST_FAIL_BLINK_MS = 100;
 
 // --- Calibration run --------------------------------------------------------
 
@@ -400,12 +418,52 @@ static constexpr uint8_t BURST_MAX_BACKLOG_PULSES = 3;
 static constexpr float BURST_LATE_FRACTION = 1.0f;
 static constexpr uint8_t BURST_LATE_PULSES = 2;
 
-// Clogged: the shaft stays under this - or under a third (CLOG_MIN_SPEED_PERCENT)
-// of what the burst PWM turns a free motor at, if that is lower - for
-// CLOG_DETECT_MS while a burst drives it: 60 RPM at full PWM, 54 at half. A
-// blocked auger reads close to 0; a heavy one that still turns, well above it -
-// a false alarm here stops the dispenser in the field.
+// A stalled burst: the shaft stays under this - or under a third
+// (CLOG_MIN_SPEED_PERCENT) of what the burst PWM turns a free motor at, if that
+// is lower - while a burst drives it: 60 RPM at full PWM, 54 at half. A blocked
+// auger reads close to 0; a heavy one that still turns, well above it.
 static constexpr uint16_t BURST_CLOG_MIN_RPM = 60;
+
+// Stalled for BURST_FAIL_MS in work, a burst has failed - a granule wedged in
+// the auger, most likely. It never raises the clog alarm (the user's rules, 29
+// September 2026: in the field the auger always went on after Anuluj, about four
+// times in 700 m): the burst stops, what it still owed - one pulse's worth at
+// most - waits for the next wheel pulse, and that pulse's burst tries again.
+// BURST_FAILS_BEFORE_UNCLOG failures in a row, with no burst reaching its count
+// in between, run the unclog sequence by themselves (AutoUnclogging), and
+// metering goes on after it - for as long as it takes, never Clogged. The only
+// sign on the tractor is the yellow LED blinking twice per failure. The
+// calibration run still stops as Clogged after CLOG_DETECT_MS: the unclog's
+// reverse turns would count in its weighing.
+static constexpr uint32_t BURST_FAIL_MS = 1500;
+static constexpr uint8_t BURST_FAILS_BEFORE_UNCLOG = 3;
+
+// After every burst - in work, in the calibration run and in the simulation,
+// and after a failed one too - a short push backwards: BURST_BACKLASH_PERMILLE
+// of full PWM for BURST_BACKLASH_MS, starting BURST_BACKLASH_DELAY_MS after the
+// motor stopped, when the brake has the shaft still (sooner, the push would
+// only brake harder). It is not meant to turn the auger, only to open the
+// gearbox's backlash, so the next burst's motor gets a little free travel to
+// gain speed in before the teeth take the load: a burst that starts with the
+// teeth already pressed together starts from a dead point (the user's idea,
+// 29 September 2026). Not measured - and the encoder, which cannot tell the
+// direction, counts it as a few more edges turned; the calibration run pushes
+// back after its bursts too, so the weighing takes that in. The next burst waits
+// until the push is over. BURST_BACKLASH_MS 0 turns it off.
+static constexpr uint16_t BURST_BACKLASH_PERMILLE = 100; // 10 %
+static constexpr uint32_t BURST_BACKLASH_MS = 50;
+static constexpr uint32_t BURST_BACKLASH_DELAY_MS = 30;
+
+// The seeding simulation (tractor menu -> Symulacja): burst metering exactly as
+// in work - failed bursts, retries and the unclog sequence included - standing
+// still, on the pulses SIMULATION_SPEED_MM_S would give with the tractor's
+// distance per pulse, for SIMULATION_MINUTES. The endurance test the user asked
+// for (29 September 2026): the clogs came after a few passes, not at once. The
+// tractor shows the failed bursts as a share of all of them. Both boards read
+// these; reflash both after a change.
+static constexpr uint16_t SIMULATION_SPEED_MM_S = 1944; // 7 km/h
+static constexpr uint8_t SIMULATION_MINUTES = 15;
+static constexpr uint32_t SIMULATION_DURATION_MS = (uint32_t)SIMULATION_MINUTES * 60UL * 1000UL;
 
 // The shaft RPM the tractor shows is averaged over about this long: the shaft
 // itself alternates between the burst's speed and standing still.
@@ -422,6 +480,18 @@ static_assert((float)BURST_MAX_BACKLOG_PULSES >= 1.0f + BURST_LATE_FRACTION,
               "BURST_MAX_BACKLOG_PULSES must leave room for a late pulse");
 static_assert(BURST_CLOG_MIN_RPM > 0 && BURST_CLOG_MIN_RPM < MOTOR_MAX_RPM,
               "BURST_CLOG_MIN_RPM must be between 0 and the motor's speed");
+// Every burst's first step measures the standstill before it and starts the
+// timer; it takes a later step at speed to stop it again.
+static_assert(BURST_FAIL_MS >= 3 * MOTOR_CONTROL_INTERVAL_MS,
+              "BURST_FAIL_MS must span several control steps");
+static_assert(BURST_FAILS_BEFORE_UNCLOG >= 1, "BURST_FAILS_BEFORE_UNCLOG must be at least one failure");
+static_assert(BURST_BACKLASH_PERMILLE <= 1000, "BURST_BACKLASH_PERMILLE is a share of full PWM, in per mille");
+// The push has to be over well within a control step's worth of the next
+// burst's wait, and a step that lands in it must still see it running.
+static_assert(BURST_BACKLASH_DELAY_MS + BURST_BACKLASH_MS < 2 * MOTOR_CONTROL_INTERVAL_MS,
+              "the push backwards after a burst must be short");
+static_assert(SIMULATION_SPEED_MM_S > 0 && SIMULATION_MINUTES >= 1 && SIMULATION_MINUTES <= 99,
+              "the simulation needs a speed, and a length the tractor can show as mm:ss");
 static_assert(CALIBRATION_PULSES >= 1, "CALIBRATION_PULSES must be at least one pulse");
 static_assert(BURST_ANGLE_REFERENCE_RPM > 0 && BURST_ANGLE_REFERENCE_SPEED_MM_S > 0,
               "the angle factor's reference must be a speed of the motor and of the machine");

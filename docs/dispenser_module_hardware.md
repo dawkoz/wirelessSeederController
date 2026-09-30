@@ -525,14 +525,14 @@ to fit it, and asks you to remove it before it does anything else.
 
 | Keys | What you need | What it proves |
 |---|---|---|
-| `d` | nothing connected | the decision logic and the distance ledger, 35 + 12 checks, and burst metering, 30 more (B01–B30: bursts at full and at half PWM, the calibration run, and the whole weigh-and-correct procedure through the tractor's angle-factor arithmetic) — a second or two |
+| `d` | nothing connected | the decision logic and the distance ledger, 35 + 12 checks, and burst metering, 35 more (B01–B35: bursts at full and at half PWM, the calibration run, the whole weigh-and-correct procedure through the tractor's angle-factor arithmetic, failed bursts with the unclog they lead to, the seeding simulation, and the push backwards after every burst) — a second or two |
 | `w` | nothing connected | ground speed from wheel pulses (the seeder's own logic), 12 checks — W12 is how steady the averaged speed stays with scattered gaps |
 | `v` | nothing connected | packet validation, the inbox and the link timing |
 | `h` | coupling off, shaft free to turn | supply, driver, motor, both encoder channels, DIR, radio |
 | `m` | coupling off, shaft free | metering and every link-loss case, with the motor running; M11 checks the turns delivered over simulated ground |
 | `c` | coupling off, shaft free | the 100-revolution calibration run |
 | `k` | coupling off; K07 needs the lever | clog detection and the unclog sequence |
-| `b` | coupling off, shaft free | burst metering with the motor (U01–U04), at the production burst PWM (`BURST_PWM_FRACTION`): one burst per simulated wheel pulse, the turns against the ground, over speed, the calibration run, a clog in the middle of a burst |
+| `b` | coupling off, shaft free | burst metering with the motor (U01–U04), at the production burst PWM (`BURST_PWM_FRACTION`): one burst per simulated wheel pulse, the turns against the ground, over speed, the calibration run, a stuck auger: failed bursts, then the unclog by itself |
 
 `a` runs all of them in that order, `r` prints the summary so far, `x` stops the
 motor, `?` reprints the menu and the boot report.

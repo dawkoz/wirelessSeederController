@@ -9,12 +9,12 @@
 // ---------------------------------------------------------------------------
 // U tests: burst metering with the real motor and encoder - what the B tests
 // can only assume: how fast the motor really turns in a burst, how far it runs
-// on after a burst is cut, the calibration run, and a clog in the middle of a
-// burst. Real time and simulated packets, like the M tests, with burst metering
-// switched on whatever DISPENSER_BURST_MODE says, at the production burst PWM
-// (BURST_PWM_FRACTION). The angle factor's angle follows the PWM, so the
-// ground speeds below keep the motor as busy at any PWM, and the time limits
-// follow it.
+// on after a burst is cut, the calibration run, and a stuck auger - a failed
+// burst, then the unclog it leads to. Real time and simulated packets, like the
+// M tests, with burst metering switched on whatever DISPENSER_BURST_MODE says,
+// at the production burst PWM (BURST_PWM_FRACTION). The angle factor's angle
+// follows the PWM, so the ground speeds below keep the motor as busy at any
+// PWM, and the time limits follow it.
 //
 // Coupling off and a free shaft, like the M tests. Run on the fitted module
 // with the auger coupled and fertilizer in the hopper (bench image flashed, a
@@ -53,7 +53,7 @@ static bool uPump(uint32_t ms, UWatch &w)
         w.lastEdges = edges;
         w.lastMs    = now;
 
-        bool on = out.motorPermille > 0;
+        bool on = out.motorPermille > 0 && out.motorForward;   // a burst, not the push back after one
         if (on && !w.motorOn) w.bursts++;
         w.motorOn = on;
 
@@ -65,6 +65,10 @@ static bool uPump(uint32_t ms, UWatch &w)
     }
     return true;
 }
+
+// The logic's failed-burst count when U04 cuts the encoder. A file static,
+// because pollUntil() takes plain functions.
+static uint8_t uFailBase = 0;
 
 static double uBurstRPM(const UWatch &w)
 {
@@ -245,7 +249,7 @@ static void runBurstMotorTests()
         bool     done     = false;
         while (millis() - start < limit) {
             if (!benchPump()) { reportLine("U03", Outcome::Aborted, "aborted by key"); return; }
-            bool on = out.motorPermille > 0;
+            bool on = out.motorPermille > 0 && out.motorForward;
             if (on && !wasOn) bursts++;
             wasOn = on;
             if (logic.mode != DispenserMode::Calibrating) {
@@ -273,9 +277,12 @@ static void runBurstMotorTests()
                     (unsigned long)(ENCODER_EDGES_PER_REV / 2), (logic.progress == 100) ? "yes" : "NO");
     }
 
-    // U04 - a clog in the middle of a burst: channel A detached while the motor
-    // runs, so the logic sees a shaft that has stopped while driven. Below full
-    // PWM that first brings full PWM (the stall push), then the clog.
+    // U04 - a stuck auger: channel A detached while the motor runs, so the
+    // logic sees a shaft that has stopped while driven (below full PWM, full
+    // PWM first - the stall push). The burst fails after BURST_FAIL_MS - motor
+    // off, never Clogged - and with the shaft still "stuck" and the ground
+    // moving, BURST_FAILS_BEFORE_UNCLOG failures in a row start the unclog
+    // sequence by itself. Channel A back, metering goes on after it.
     if (abortRequested) return;
     {
         TestMarker tm("U04");
@@ -291,22 +298,31 @@ static void runBurstMotorTests()
         if (abortRequested) { reportLine("U04", Outcome::Aborted, "aborted by key"); return; }
         if (!runFor(150)) { reportLine("U04", Outcome::Aborted, "aborted by key"); return; }
 
+        uFailBase = logic.burstFailures;
         uint32_t t0 = millis();
         encoderEnd();
-        bool clogged = pollUntil(CLOG_DETECT_MS + 400, []() { return logic.mode == DispenserMode::Clogged; });
-        uint32_t msToClog = millis() - t0;
+        bool failed = pollUntil(BURST_FAIL_MS + 400, []() { return logic.burstFailures != uFailBase; });
+        uint32_t msToFail = millis() - t0;
+        bool dutyZero = (out.motorPermille == 0);
+        if (abortRequested) { encoderBegin(); reportLine("U04", Outcome::Aborted, "aborted by key"); return; }
+
+        // Still stuck: the rest of the run of failures, then the unclog.
+        uint32_t interval = (uint32_t)injector.tractor.wheelMmPerPulse * 1000 / injector.seeder.groundSpeedMmS;
+        uint32_t limit    = (uint32_t)BURST_FAILS_BEFORE_UNCLOG * (BURST_FAIL_MS + interval) + 1000;
+        bool unclogging = pollUntil(limit, []() { return logic.mode == DispenserMode::AutoUnclogging; });
+        uint8_t failures = (uint8_t)(logic.burstFailures - uFailBase);
         encoderBegin();
         if (abortRequested) { reportLine("U04", Outcome::Aborted, "aborted by key"); return; }
 
-        bool dutyZero = (out.motorPermille == 0);
-        if (!runFor(2000)) { reportLine("U04", Outcome::Aborted, "aborted by key"); return; }
-        bool stays = (logic.mode == DispenserMode::Clogged) && (out.motorPermille == 0);
+        bool back = pollUntil(UNCLOG_TOTAL_MS + 500, []() { return logic.mode == DispenserMode::Normal; });
+        if (abortRequested) { reportLine("U04", Outcome::Aborted, "aborted by key"); return; }
 
-        bool ok = inBurst && clogged && msToClog >= CLOG_DETECT_MS && msToClog <= CLOG_DETECT_MS + 400
-               && dutyZero && stays;
-        reportCheck("U04", ok, "encoder cut mid-burst: Clogged after %lu ms (want %lu..%lu), duty 0 %s, "
-                    "stays Clogged with the ground moving %s",
-                    (unsigned long)msToClog, (unsigned long)CLOG_DETECT_MS,
-                    (unsigned long)(CLOG_DETECT_MS + 400), dutyZero ? "yes" : "NO", stays ? "yes" : "NO");
+        bool ok = inBurst && failed && msToFail >= BURST_FAIL_MS && msToFail <= BURST_FAIL_MS + 400 && dutyZero
+               && unclogging && failures == BURST_FAILS_BEFORE_UNCLOG && back && !gSawClogged;
+        reportCheck("U04", ok, "encoder cut mid-burst: failed after %lu ms (want %lu..%lu), duty 0 %s; unclogging "
+                    "by itself after %u failures (want %u) %s; metering after it %s; never Clogged %s",
+                    (unsigned long)msToFail, (unsigned long)BURST_FAIL_MS, (unsigned long)(BURST_FAIL_MS + 400),
+                    dutyZero ? "yes" : "NO", (unsigned)failures, (unsigned)BURST_FAILS_BEFORE_UNCLOG,
+                    unclogging ? "yes" : "NO", back ? "yes" : "NO", gSawClogged ? "NO" : "yes");
     }
 }
